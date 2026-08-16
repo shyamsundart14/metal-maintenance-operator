@@ -36,34 +36,67 @@ components:
 ```
 
 **Ops does not want to type versions and paths.** They want to edit a Git manifest
-and name a single **baseline**:
+and name a single **quarterly baseline release**:
 
 ```yaml
 spec:
-  buildingBlockSelector: { matchLabels: { kubernetes.metal.cloud.sap/bb: bb085 } }
-  firmwareBaseline: "ghcr.io/myorg/firmware-baselines/compute:2026-Q1"
+  buildingBlockSelector:  { matchLabels: { kubernetes.metal.cloud.sap/bb: bb085 } }
+  firmwareBaselineFamily:  "ghcr.io/myorg/firmware-baselines"
+  firmwareBaselineRelease: "2026-Q1"
 ```
 
 The versions and artifact locations move **out of the CR** and **into the
-baseline**. This document defines the baseline as an **OCI artifact**.
+baseline** (an **OCI artifact**, §3). Note there is **no server model in the CR**:
+the controller reads each host's `kubernetes.metal.cloud.sap/type` label and
+**auto-resolves** the correct per-model artifact (§2). So Ops types **one
+quarterly name** and it works across a mixed fleet.
 
-## 2. What a baseline is
+## 2. What a baseline is — one artifact per model + generation
 
 A baseline is a named, versioned, signed **manifest-of-manifests**: it maps every
 component type to the firmware version and binary that constitute a tested,
-known-good fleet state. Conceptually it is what HPE's SPP, Dell's catalog, and
-Lenovo's UpdateXpress bundle are — a curated set — but expressed as an
-OCI-native artifact rather than a vendor ISO.
+known-good state. Conceptually it is what HPE's SPP, Dell's catalog, and Lenovo's
+UpdateXpress bundle are — a curated set — but OCI-native rather than a vendor ISO.
 
-Example logical content of `compute:2026-Q1`:
+### The unit is the server model + generation, **not** the whole fleet
+
+Firmware is **not portable across models/generations** — especially BIOS and BMC
+(a Dell R740XD BIOS ≠ R760 ≠ HPE DL360 Gen10 ≠ Gen11; iDRAC ≠ iLO ≠ XCC). A single
+"all models, all components" artifact would be a grab-bag of incompatible binaries,
+and a CR would still have to select the slice for each host. So a baseline is
+scoped to **one hardware type**, containing only the components that type has:
 
 ```
-cx6dx     → version 22.35.10.12, blob <digest>
-cx5ex     → version 16.35.30.06, blob <digest>
-bcm57508  → version 23.31.18.10, blob <digest>
-i350      → version 22.5.7,      blob <digest>
-bios      → version 2.19.0,      blob <digest>
+ghcr.io/myorg/firmware-baselines/dell-r740xd:2026-Q1
+   bios      → 2.19.0        blob <digest>
+   idrac     → <ver>         blob <digest>
+   cx6dx     → 22.35.10.12   blob <digest>
+   i350      → 22.5.7        blob <digest>
+
+ghcr.io/myorg/firmware-baselines/hpe-dl360gen11:2026-Q1
+   systemrom → <ver>         blob <digest>
+   ilo       → <ver>         blob <digest>
+   cx6dx     → 22.35.10.12   blob <digest>
+
+ghcr.io/myorg/firmware-baselines/lenovo-sr650v3:2026-Q1
+   uefi      → <ver>         blob <digest>
+   xcc       → <ver>         blob <digest>
+   bcm57508  → <ver>         blob <digest>
 ```
+
+- **`2026-Q1` is a tag convention shared across the per-model family** — the
+  quarterly release, not a single blob. Cutting a new release re-tags each
+  per-model artifact `2026-Q2`, etc.
+- Each per-model artifact is a **self-consistent, tested set** for that hardware —
+  the only level at which "all these components at these versions" is a meaningful,
+  auditable claim.
+- This aligns with two facts already in the design: a **building block is
+  single-model** (R3), so one CR → one model's baseline; and argora already stamps
+  the model on each host as `kubernetes.metal.cloud.sap/type`, which is the key the
+  controller resolves against (§5).
+- **Shared components (e.g. `cx6dx`) may repeat across per-model artifacts** —
+  acceptable; the OCI registry deduplicates identical blobs by digest, so the same
+  NIC firmware is stored once regardless of how many baselines reference it.
 
 ## 3. Why OCI artifact (vs. Git file, vs. ISO)
 
@@ -78,8 +111,8 @@ bios      → version 2.19.0,      blob <digest>
 
 The **baseline itself is stored as an OCI artifact** (baseline-as-artifact): an OCI
 manifest listing the components + versions, with each firmware binary as a
-referenced OCI **blob**. So one signed, tagged reference (`…/compute:2026-Q1`)
-carries both the *mapping* and the *bits*.
+referenced OCI **blob**. So one signed, tagged reference
+(`…/dell-r740xd:2026-Q1`) carries both the *mapping* and the *bits* for one model.
 
 > **Not an ISO.** An ISO (or any bundle) is inert packaging; on its own it cannot
 > decide which file applies to which component on which host. That matching is
@@ -88,50 +121,111 @@ carries both the *mapping* and the *bits*.
 > baseline is a *storage/distribution* format, not a substitute for discovery
 > (see §6).
 
-## 4. Artifact structure (sketch)
+## 4. Artifact structure — a worked example
 
-Using the OCI image-manifest with a firmware-specific artifact type:
+Every OCI artifact is three kinds of things, all stored in the registry and
+addressed by SHA-256 digest: **blobs** (the big files), a **config** (small JSON
+describing what it is), and a **manifest** (the index tying them together). The tag
+(`dell-r740xd:2026-Q1`) is a human-friendly pointer to the manifest's digest.
 
-```jsonc
-// manifest — artifactType marks it as a firmware baseline
+Worked example for `ghcr.io/myorg/firmware-baselines/dell-r740xd:2026-Q1`.
+
+### 4.1 Blobs — the firmware binaries (stored as-is)
+
+| Blob (by digest) | What it is | Size |
+|---|---|---|
+| `sha256:a1b2…` | `cx6dx-22.35.10.12.bin` (ConnectX-6 Dx) | 4 MB |
+| `sha256:c3d4…` | `i350-22.5.7.bin` (Intel I350) | 512 KB |
+| `sha256:e5f6…` | `bios-r740xd-2.19.0.bin` | 8 MB |
+
+Raw bytes — the same files you'd otherwise host on an HTTP server, deduplicated by
+hash across baselines.
+
+### 4.2 Config — the baseline map (the human-authored part)
+
+```json
 {
-  "schemaVersion": 2,
   "artifactType": "application/vnd.metal.ironcore.firmware.baseline.v1+json",
-  "config": { "mediaType": "application/vnd.metal.ironcore.firmware.baseline.config.v1+json",
-              "digest": "sha256:…" },       // the component→version map
-  "layers": [
-    { "mediaType": "application/vnd.metal.ironcore.firmware.blob",
-      "digest": "sha256:…", "size": 4194304,
-      "annotations": { "firmware.metal.ironcore.dev/component": "cx6dx",
-                       "firmware.metal.ironcore.dev/version":   "22.35.10.12" } },
-    { "mediaType": "application/vnd.metal.ironcore.firmware.blob",
-      "digest": "sha256:…", "size": 8388608,
-      "annotations": { "firmware.metal.ironcore.dev/component": "bios",
-                       "firmware.metal.ironcore.dev/version":   "2.19.0" } }
-    // … one layer per component firmware …
+  "baseline": "dell-r740xd-2026-Q1",
+  "serverType": "poweredge-r740xd",
+  "components": [
+    { "token": "cx6dx", "component": "NIC",  "version": "22.35.10.12", "blobDigest": "sha256:a1b2…" },
+    { "token": "i350",  "component": "NIC",  "version": "22.5.7",      "blobDigest": "sha256:c3d4…" },
+    { "token": "bios",  "component": "BIOS", "version": "2.19.0",      "blobDigest": "sha256:e5f6…" }
   ]
 }
 ```
 
-The `config` blob is the human-authored **baseline map** (component token → version
-→ which layer). A new baseline = build this artifact, sign it, push it, tag it.
+This is the answer to *"what does the OCI contain?"*: the firmware binaries **plus a
+map** stating which binary is which component at which version. `serverType` is what
+the controller matches against the host's `…/type` label (§5).
+
+### 4.3 Manifest — the index
+
+Layer `annotations` carry the mapping so it can be read without pulling the config:
+
+```jsonc
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "artifactType": "application/vnd.metal.ironcore.firmware.baseline.v1+json",
+  "config": {
+    "mediaType": "application/vnd.metal.ironcore.firmware.baseline.config.v1+json",
+    "digest": "sha256:9f8e…", "size": 412            // the §4.2 JSON
+  },
+  "layers": [
+    { "mediaType": "application/vnd.metal.ironcore.firmware.blob",
+      "digest": "sha256:a1b2…", "size": 4194304,
+      "annotations": { "component": "cx6dx", "version": "22.35.10.12",
+                       "org.opencontainers.image.title": "cx6dx-22.35.10.12.bin" } },
+    { "mediaType": "application/vnd.metal.ironcore.firmware.blob",
+      "digest": "sha256:e5f6…", "size": 8388608,
+      "annotations": { "component": "bios", "version": "2.19.0",
+                       "org.opencontainers.image.title": "bios-r740xd-2.19.0.bin" } }
+    // … one layer per component …
+  ]
+}
+```
+
+Signing with cosign adds a fourth thing: a signature artifact attached to this
+manifest's digest, so the controller can verify the bytes are untampered.
+
+### 4.4 Building it (real commands, via `oras`)
+
+```sh
+oras push ghcr.io/myorg/firmware-baselines/dell-r740xd:2026-Q1 \
+  --artifact-type application/vnd.metal.ironcore.firmware.baseline.v1+json \
+  --config baseline-map.json:application/vnd.metal.ironcore.firmware.baseline.config.v1+json \
+  cx6dx-22.35.10.12.bin:application/vnd.metal.ironcore.firmware.blob \
+  i350-22.5.7.bin:application/vnd.metal.ironcore.firmware.blob \
+  bios-r740xd-2.19.0.bin:application/vnd.metal.ironcore.firmware.blob
+
+cosign sign ghcr.io/myorg/firmware-baselines/dell-r740xd:2026-Q1   # recommended
+```
+
+Cutting next quarter's baseline = new versions/blobs, re-push as `…:2026-Q2`.
 
 ## 5. Resolution flow (what the controller does)
 
 The manifest names a baseline; the controller does the rest:
 
 ```
-Ops CR:  firmwareBaseline: ghcr.io/myorg/firmware-baselines/compute:2026-Q1
+Ops CR:  firmwareBaselineFamily: ghcr.io/myorg/firmware-baselines
+         firmwareBaselineRelease: 2026-Q1
         │
-1. Resolve — pull the baseline OCI artifact; verify its signature (cosign);
-             read the config → { cx6dx: 22.35.10.12, bios: 2.19.0, … }
+0. Resolve model — read host's kubernetes.metal.cloud.sap/type label
+             (e.g. poweredge-r740xd) → artifact ref
+             ghcr.io/myorg/firmware-baselines/dell-r740xd:2026-Q1
+        │
+1. Resolve baseline — pull that OCI artifact; verify its signature (cosign);
+             read the config → { cx6dx: 22.35.10.12, i350: 22.5.7, bios: 2.19.0 }
         │
 2. Per host — DISCOVER via Redfish FirmwareInventory (unchanged, §6):
              which components exist here, their current versions, Targets @odata.id
         │
 3. Match — intersect discovered components with the resolved baseline:
              host has a cx6dx at 22.31 → baseline says 22.35 → needs update
-             host has no cx5ex → baseline's cx5ex entry is irrelevant here
+             host has no cx5ex → not in this model's baseline anyway
         │
 4. Serve — extract the needed firmware blob from the artifact, verify digest,
            place it on a BMC-reachable HTTPS endpoint (BMC cannot pull OCI)
@@ -140,14 +234,14 @@ Ops CR:  firmwareBaseline: ghcr.io/myorg/firmware-baselines/compute:2026-Q1
            (staging + gated reboot exactly as firmware-update-design.md)
 ```
 
-Steps 2–5 are the **existing** design. The baseline layer adds only steps 1 and 3
-(resolve + match) — everything below stays the same.
+Steps 2–5 are the **existing** design. The baseline layer adds only steps 0, 1 and
+3 (resolve model → resolve baseline → match) — the actual apply is unchanged.
 
 ## 6. What the baseline does NOT do — discovery is still required
 
-This is the load-bearing caveat. **A baseline is fleet-wide truth; it is not
-per-host reality.** It says "the compute fleet's ConnectX-6 Dx should be at
-22.35.10.12." It does **not** know:
+This is the load-bearing caveat. **A baseline is per-model truth; it is not
+per-host reality.** It says "an R740XD's ConnectX-6 Dx should be at 22.35.10.12." It
+does **not** know:
 
 - **which** hosts actually have a ConnectX-6 Dx (or in which slot),
 - what **version** each is currently running,
@@ -194,7 +288,14 @@ fleet-level orchestration lives) without upstream changes.
 
 1. **Baseline authoring** — who builds/signs the OCI baseline, and from what
    source (a vendor SPP/catalog cracked into blobs, or hand-curated)? This is the
-   curation burden; keeping it small is what makes the model sustainable.
+   curation burden; keeping it small is what makes the model sustainable. Note the
+   per-model scoping (§2) means **one artifact per model+generation per release** —
+   more artifacts to author, but each maps cleanly to a vendor's per-platform SPP.
+6. **Model-label mapping** — the controller resolves the host's
+   `kubernetes.metal.cloud.sap/type` slug (e.g. `poweredge-r740xd`) to a baseline
+   repo name (`dell-r740xd`). Is that a direct slug match, or is a small
+   type→baseline mapping table needed? A host whose `type` has no matching baseline
+   in the release must be surfaced (Blocked/warning), not silently skipped.
 2. **Registry reachability** — can the BMC management network reach an HTTPS
    endpoint co-located with the registry, to keep the unpack-and-serve shim thin?
 3. **Signature policy** — is cosign verification of the baseline mandatory before
