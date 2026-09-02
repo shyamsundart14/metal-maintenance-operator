@@ -193,6 +193,113 @@ Notes that matter for the design:
   surface a clear "BMC not licensed for repository update" condition rather than
   failing opaquely.
 
+## 3b. HOW it works — component discovery and payload selection
+
+This is the mechanism behind the one-parameter `UpdateFromRepository` call: what XCC
+does *after* you hand it `RepoURI`, and how it lands on the right payload for each
+device. All of the following is grounded in the real SR645 V3 / SR665 V3 bundle
+(`lnvgy_bundle_svcpack_ka-j9ltd-01a2-24a.0_platform_comp`, machine types
+`7D9A`–`7D9D`).
+
+### 3b.1 The two inventories that get compared
+
+A repository update is fundamentally a **diff of two inventories**:
+
+1. **Live host inventory** — what XCC already knows about the server. XCC
+   continuously enumerates the host's devices (over PCIe/SMBus/the management path)
+   and tags each with a **stable hardware identity**: a PCI subsystem id
+   (`vendor:device:subsysVendor:subsysDevice`) surfaced as an **`AgentlessId`**
+   (e.g. `17AA402D`) and one or more **`SoftwareId`s**
+   (e.g. `DEVICE-14E4-1657-17AA-402D-13`), each with a currently-installed version.
+   This is the same identity Redfish exposes under `/redfish/v1/UpdateService/FirmwareInventory`.
+
+2. **Repository (catalog) inventory** — what the bundle *offers*, read from the root
+   catalog `<bundle>_index.json` → `Updates[]`, where every entry declares the
+   `SoftwareId`s it can update and the version it would bring them to.
+
+XCC matches **repository entries to live devices by `SoftwareId` / `AgentlessId`**,
+then compares versions. **The PCI-subsystem id is the join key** — not the model
+name, not the filename.
+
+### 3b.2 Step-by-step, for one device
+
+Take the Broadcom NX1 NIC in this bundle:
+
+```
+Live device (XCC inventory):  AgentlessId 17AA402D,
+                              SoftwareId DEVICE-14E4-1657-17AA-402D-13 @ (say) 227.0.1.x
+
+Catalog entry (Updates[i]):
+  "Oem": { "Inventory": [ { "SoftwareId": "DEVICE-14E4-1657-17AA-402D-13",
+                            "Version": "227.0.3.1" } ] }          ← match by SoftwareId
+  "Inventory": "brcm-...402d-227.0.3.1-0342_anyos_comp_inventory.json"   ← descriptor
+  "Locations": "brcm-...402d-...location.json"                    ← where to fetch (empty = local)
+  "AuthenticitySignature": "brcm-...signature.json"              ← PGP + SHA-256 to verify
+  "Payload": "payloads/firmware/brcm-...402d-227.0.3.1-034_anyos_comp.lvt"  ← the image
+```
+
+1. **Machine-type gate.** Each catalog entry (and the descriptor) carries
+   `ApplicableMachineTypes`. XCC first checks its own machine type (`7D9A`…) is in
+   that list; if not, the entry is skipped for this host. (The bundle-level
+   `Oem.ApplicableMachineTypes` stamps the pack — here SR645 V3 / SR665 V3; the
+   per-component list can be broader, so match on the specific host's type.)
+2. **Identity match.** XCC finds a live device whose `SoftwareId` / `AgentlessId`
+   equals the entry's `Oem.Inventory[].SoftwareId`. No live device with that id →
+   the payload is irrelevant to this host and is not applied.
+3. **Applicability / OOB gate.** The descriptor (`_inventory.json`) says whether the
+   package can be applied out-of-band and how: `UpdateType` (`OOB`, `BMU`, or
+   `Core`) and `ActivationMethod` (`Self-Contained`, `System reboot`,
+   `Medium-specific reset`, `AC power cycle`, `Automatic`). XCC only applies packages
+   it can drive out-of-band on this host.
+4. **Version compare.** If the catalog `Version` differs from the installed version
+   (and satisfies `Prerequisites` / `MinimumSupportedVersion`, which encode ordering
+   — e.g. "XCC before UEFI"), the component is **queued**; otherwise it is skipped as
+   already-current.
+5. **Locate the payload.** The entry's `Payload` is a **path relative to the
+   repository root** (`payloads/…/*.lvt|*.uxz`). For a mounted CIFS/NFS repo the
+   image is read directly from that path; `Locations` (`_location.json`) supplies a
+   download URL when the repo is remote/HTTP and the payload isn't co-located (it is
+   `[]` in this offline pre-staged bundle).
+6. **Verify then flash.** Before flashing, XCC checks the payload against
+   `_signature.json` — the detached **PGP signature** ("Lenovo Group ISG RSA 4096")
+   and the **SHA-256** — so a tampered or truncated image is rejected. Only then does
+   it write the firmware and sequence any required reset per `ActivationMethod`.
+
+### 3b.3 What this bundle actually contains (the gates are real)
+
+Counts across the 305 components in this bundle show the gates above are not
+hypothetical — components genuinely differ in how they apply:
+
+- **`UpdateType`:** `BMU` ×250, `OOB` ×51, `Core` ×4 — i.e. most need the bare-metal
+  updater assist (`BMU`), some are pure out-of-band, a few are core-firmware.
+- **`ActivationMethod`:** `Self-Contained` ×259, `System reboot` ×28,
+  `Medium-specific reset` ×11, `Automatic` ×5, `AC power cycle` ×1 — so **reboot is
+  not uniform**; XCC decides per component from the descriptor, which is why the
+  action takes no client reboot flag.
+
+### 3b.4 Why the client stays thin — and what a controller can pre-compute
+
+Because **XCC performs discovery, matching, applicability, version-diff, and
+verification itself**, the Redfish client supplies only `RepoURI` (+ creds). The
+"intelligence" lives in the repository metadata, not the caller.
+
+That same metadata, however, is fully readable **offline**, so a controller does not
+have to fly blind:
+
+- It can pre-resolve the **model → machine-type code** (SR645 V3 → `7D9A`…) to pick
+  the right bundle for a host.
+- It can **replicate the version-diff** (catalog `Version` vs.
+  `/redfish/v1/UpdateService/FirmwareInventory`) to predict what *would* change — the
+  same result `GetRepoUpdateDetail` returns, but computed from the catalog without
+  touching the BMC.
+- It can read `ActivationMethod` up front to know **which updates force a reboot**,
+  and gate host drain/evacuation accordingly (the live-ESXi concern in §8).
+
+**In short:** discovery is by **stable PCI-subsystem identity** (`SoftwareId` /
+`AgentlessId`), payload selection is a **`SoftwareId` → catalog entry → relative
+`Payload` path** lookup gated by machine-type + OOB-applicability + version, and
+integrity is enforced by per-payload **PGP + SHA-256** before flashing.
+
 ## 4. Full parity with Dell — the catalog model is a two-vendor solution over Redfish
 
 The three Lenovo OEM actions map almost 1:1 onto Dell's repository actions used by
