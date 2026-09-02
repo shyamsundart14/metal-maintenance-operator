@@ -154,6 +154,45 @@ is the short subsystem form XCC matches against live inventory.
 - **XCC does the matching** at `UpdateFromRepository` time — the client still only
   supplies `RepoURI`. This schema is what makes that one-parameter call work.
 
+## 3a. Licensing requirement — the repository path is license-gated (and the tier name changes per generation)
+
+**`UpdateFromRepository` / repository-sync is not available on a base-licensed XCC.**
+The CIFS / NFS / HTTPS repository transports are premium features, and — critically
+for a mixed fleet — **the required license tier is named differently on each XCC
+generation.** A controller (and fleet planning) must key the check off the XCC
+generation, not a single tier name.
+
+| XCC generation | Servers (this fleet) | Required license (repo over CIFS/NFS/HTTPS) | Exact wording |
+|---|---|---|---|
+| **XCC (gen 1)** | ThinkSystem V1 / V2 (e.g. SR650, SR850P, SR950) | **XCC Enterprise** (tiers: Standard / Advanced / Enterprise) | Repo doc omits it; Enterprise is the top tier that carries remote-media/repository features |
+| **XCC2** | ThinkSystem V3 (SR650 V3, SR655 V3, SR675 V3, SR680a V3, SR850 V3, SR950 V3, …) | **XCC Platinum** | *"CIFS/NFS/HTTPS/Onboard Firmware History functionality requires XCC Platinum license."* |
+| **XCC3** | ThinkSystem V4 (SR650 V4, SR850 V4, …) | **XCC Premier** | *"CIFS/NFS/HTTPS/Onboard Firmware History functionality requires XCC Premier license."* |
+
+Notes that matter for the design:
+
+- **HTTP (plain) is *not* listed as license-gated** on XCC2/XCC3 — only
+  CIFS / NFS / **HTTPS** are. If a repository is served over plain HTTP, the premium
+  license may not be required. This is a meaningful lever for a fleet that cannot
+  license every BMC: a controller-hosted **HTTP** repository could sidestep the
+  Platinum/Premier requirement (at the cost of TLS on the repo fetch — acceptable
+  only on a trusted management network, and to be weighed against the PGP/SHA-256
+  integrity the bundle metadata already carries, see §3.1c).
+- **`SimpleUpdate` / multipart HTTP push is *not* gated by these tiers** — pushing a
+  bundle to `/mfwupdate` or an image via `SimpleUpdate` does not need Platinum/Premier.
+  So an unlicensed-for-repo BMC still has the **push** fallback (subject to the
+  250 MB `MaxImageSizeBytes` ceiling, §7), just not the "point at a repo and let XCC
+  pull the whole bundle" convenience.
+- **Onboard Firmware History** (the MicroSD-backed bundle history that
+  `BundleRollback` relies on) is gated by the **same** Platinum/Premier tier. So on a
+  base-licensed XCC, both repo-update *and* bundle rollback are unavailable together.
+- The tier is **per-BMC**, applied as a Feature-on-Demand (FoD) key. Fleet rollout
+  therefore has a **licensing prerequisite step**: confirm/activate the correct tier
+  (Enterprise / Platinum / Premier by generation) on every target BMC before the
+  repository controller can drive it. The controller should **detect** the license
+  (or detect the `UpdateFromRepository` action's absence / a license error) and
+  surface a clear "BMC not licensed for repository update" condition rather than
+  failing opaquely.
+
 ## 4. Full parity with Dell — the catalog model is a two-vendor solution over Redfish
 
 The three Lenovo OEM actions map almost 1:1 onto Dell's repository actions used by
@@ -241,10 +280,18 @@ fully surfaced in public documentation; querying a real device is authoritative.
   non-disk environment — the controller must guarantee the host returns to its
   production OS (the same boot-from-disk requirement as
   [firmware-update-design.md](firmware-update-design.md) §7a).
+- **Licensing is a hard prerequisite (§3a).** The repository path needs XCC
+  **Enterprise (gen 1) / Platinum (XCC2, V3) / Premier (XCC3, V4)** depending on the
+  BMC generation. The controller must treat "BMC licensed for repository update" as a
+  precondition — detect it (or detect a license error / a missing
+  `UpdateFromRepository` action) and report a clear condition, and fleet onboarding
+  must include activating the correct FoD tier per BMC. Plain **HTTP** repositories
+  and the `SimpleUpdate`/multipart **push** path are the unlicensed fallbacks.
 - **Open items to verify next on a live XCC:** the exact `GetRepoUpdateDetail`
   request/response (dry-run shape), the Task/job status structure a repo update
-  reports, and whether `UpdateFromRepository` honours an apply-time / deferral
-  option for staging.
+  reports, whether `UpdateFromRepository` honours an apply-time / deferral option for
+  staging, and **how a license error surfaces** (HTTP status / Redfish
+  `MessageId`) when the action is invoked on a base-licensed XCC.
 
 ## 9. References
 
@@ -252,8 +299,16 @@ fully surfaced in public documentation; querying a real device is authoritative.
 - Repository JSON schema (§3) characterised from the real bundle
   `lnvgy_bundle_svcpack_ka-j9ltd-01a2-24a.0_platform_comp` (System Firmware / Platform
   Bundle `24a.0`, 2024-03-01; 305 components, JSON metadata)
-- Lenovo XCC2 — Update From Repository: <https://pubs.lenovo.com/xcc2/updating_firmware_repository>
-- Lenovo XCC3 — Update From Repository: <https://pubs.lenovo.com/xcc3/updating_firmware_repository>
+- Lenovo XCC2 — Update From Repository (license: *"CIFS/NFS/HTTPS/Onboard Firmware
+  History functionality requires XCC **Platinum** license."*):
+  <https://pubs.lenovo.com/xcc2/updating_firmware_repository>
+- Lenovo XCC3 — Update From Repository (license: *"CIFS/NFS/HTTPS/Onboard Firmware
+  History functionality requires XCC **Premier** license."*):
+  <https://pubs.lenovo.com/xcc3/updating_firmware_repository>
+- Lenovo XCC (gen 1) — Update From Remote Repository (tiers Standard / Advanced /
+  **Enterprise**): <https://pubs.lenovo.com/xcc/updating_firmware_repository>
+- Lenovo Press — XCC support / license tiers on ThinkSystem servers:
+  <https://lenovopress.lenovo.com/lp0880-xcc-support-on-thinksystem-servers>
 - Lenovo XCC REST API — UpdateService: <https://pubs.lenovo.com/xcc-restapi/resource_updateservice>
 - Companion: [dell-install-from-repository.md](dell-install-from-repository.md),
   [lenovo-xcc-repository.md](lenovo-xcc-repository.md),
