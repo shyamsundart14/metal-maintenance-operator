@@ -57,6 +57,10 @@ fmt: goimports ## Run goimports against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
+.PHONY: envtest-use
+envtest-use: setup-envtest # Run envtest use to set up k8s bin dir
+	$(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN)
+
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
@@ -117,7 +121,7 @@ check: generate manifests add-license fmt lint test # Generate manifests, code, 
 
 .PHONY: docs
 docs: crd-ref-docs ## Run go generate to generate API reference documentation.
-	"$(CRD_REF_DOCS)" --source-path=./api/v1alpha1 --config=./hack/api-reference/config.yaml --renderer=markdown --output-path=./docs/api-reference/api.md
+	"$(CRD_REF_DOCS)" --source-path=./api --config=./hack/api-reference/config.yaml --renderer=markdown --output-path=./docs/api-reference/api.md
 
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.

@@ -5,6 +5,7 @@
 *.so
 *.dylib
 bin/*
+sanitizer/bin/*
 Dockerfile.cross
 
 # Test binary, built with `go test -c`
@@ -26,14 +27,5 @@ go.work
 *.swo
 *~
 
-# macOS junk
-.DS_Store
-
-# Throwaway diagnostic probe (not for upstream)
-hack/nicprobe/
-
-# Local fleet inventory (real hostnames — keep out of the repo)
-Server_from_each_model.txt
-
-# Design decks (markdown docs are the source of truth)
-docs/*.pptx
+# Helm chart dependencies
+dist/chart/charts/

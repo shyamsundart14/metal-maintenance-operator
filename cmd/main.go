@@ -9,6 +9,10 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/ironcore-dev/metal-maintenance-operator/internal/cli"
+	"github.com/ironcore-dev/metal-maintenance-operator/internal/ignition"
+	"github.com/ironcore-dev/metal-maintenance-operator/internal/server"
+
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -24,8 +28,11 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	maintenancev1alpha1 "github.com/ironcore-dev/metal-maintenance-operator/api/v1alpha1"
-	"github.com/ironcore-dev/metal-maintenance-operator/internal/controller"
+	readinessv1alpha1 "github.com/ironcore-dev/metal-maintenance-operator/api/readiness/v1alpha1"
+	vendorconsolev1alpha1 "github.com/ironcore-dev/metal-maintenance-operator/api/vendorconsole/v1alpha1"
+	maintenancectrl "github.com/ironcore-dev/metal-maintenance-operator/internal/controller/maintenance"
+	readinessctrl "github.com/ironcore-dev/metal-maintenance-operator/internal/controller/readiness"
+	vendorconsolectrl "github.com/ironcore-dev/metal-maintenance-operator/internal/controller/vendorconsole"
 	metalv1alpha1 "github.com/ironcore-dev/metal-operator/api/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
@@ -38,7 +45,8 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
-	utilruntime.Must(maintenancev1alpha1.AddToScheme(scheme))
+	utilruntime.Must(vendorconsolev1alpha1.AddToScheme(scheme))
+	utilruntime.Must(readinessv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(metalv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
@@ -54,6 +62,11 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
+	var sanitizationNamespace string
+	var sanitizationImage string
+	var sanitizationTolerations []metalv1alpha1.Toleration
+	var reportBaseURL string
+	var sanitizedServerAddress string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -73,6 +86,18 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&sanitizationNamespace, "sanitization-namespace", "",
+		"Namespace where sanitization ServerClaims are created.")
+	flag.StringVar(&sanitizationImage, "sanitization-image", "", "OS image for the sanitization job.")
+	cli.TolerationsVar(&sanitizationTolerations, "sanitization-tolerations", sanitizationTolerations,
+		"Tolerations on the sanitization claim. Formatted key=[value]:effect.")
+	flag.StringVar(&reportBaseURL, "report-base-url", "",
+		"Base URL of the sanitization callback server "+
+			"(e.g. http://metal-maintenance-operator.my-ns.svc.cluster.local:8082). "+
+			"Sanitizers POST to <base-url>/<sanitizationUID> when done.")
+	flag.StringVar(&sanitizedServerAddress, "sanitized-server-address", ":8082",
+		"Address the sanitization callback HTTP server binds to. "+
+			"Sanitizers running on bare metal POST here to report completion.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -80,6 +105,19 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if sanitizationNamespace == "" {
+		setupLog.Error(nil, "Must specify --sanitization-namespace")
+		os.Exit(1)
+	}
+	if sanitizationImage == "" {
+		setupLog.Error(nil, "Must specify --sanitization-image")
+		os.Exit(1)
+	}
+	if reportBaseURL == "" {
+		setupLog.Error(nil, "Must specify --report-base-url")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -195,11 +233,41 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.ConsoleReconciler{
+	if err = (&vendorconsolectrl.ConsoleReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Console")
+		setupLog.Error(err, "Unable to create Console controller")
+		os.Exit(1)
+	}
+
+	if err = (&maintenancectrl.ServerSanitizationReconciler{
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		SanitizationNamespace:   sanitizationNamespace,
+		SanitizationImage:       sanitizationImage,
+		SanitizationTolerations: sanitizationTolerations,
+		SanitizationIgnitionProvider: (&ignition.SanitizationProvider{
+			ReportBaseURL: reportBaseURL,
+		}).Ignition,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create ServerSanitization controller")
+		os.Exit(1)
+	}
+
+	if err = (&server.SanitizedHandler{
+		Client:                mgr.GetClient(),
+		SanitizationNamespace: sanitizationNamespace,
+		Address:               sanitizedServerAddress,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create Sanitized handler")
+		os.Exit(1)
+	}
+	if err = (&readinessctrl.ServerWiringReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create ServerWiring controller")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
