@@ -45,7 +45,7 @@ Retrieved from the XCC's own schema
 ```jsonc
 POST /redfish/v1/UpdateService/Actions/Oem/LenovoUpdateService.UpdateFromRepository
 {
-  "RepoURI":      "sftp://10.x.x.x/firmware/sr650v3",   // REQUIRED — repository server address
+  "RepoURI":      "https://10.x.x.x/firmware/sr650v3",  // REQUIRED — repository server address
   "RepoUserName": "svc-firmware",                        // optional — repo credentials
   "RepoPassword": "•••••",                               // optional
   "RepoMountOpt": "vers=3.0",                            // optional — mount options (CIFS/NFS)
