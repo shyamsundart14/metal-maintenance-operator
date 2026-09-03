@@ -215,49 +215,87 @@ first-class **batch-apply** primitive: the **HPE Install Set**. The controller
 assembles the set from the manifest diff, and iLO then applies the whole set —
 ordered, with reboots, atomically.
 
-Source-verified from `ilorest` (`MakeInstallSetCommand.py` / `InstallSetCommand.py`)
-and confirmed against the iLO OEM `UpdateService`:
+Source-verified from `ilorest` (`MakeInstallSetCommand.py` / `InstallSetCommand.py` /
+`UploadComponentCommand.py`), the HPE Server Management Portal firmware-update blog
+(part 3), and the live iLO 6 (§8):
 
 | Purpose | Endpoint | Method |
 |---|---|---|
-| Component repository (what's uploaded) | `/redfish/v1/UpdateService/ComponentRepository/?$expand=.` | `GET` |
-| List / create install sets | `/redfish/v1/UpdateService/Oem/Hpe/InstallSets/` | `GET` / `POST` |
-| Invoke a specific set | `…/Oem/Hpe/InstallSets/{id}/Actions/HpeComponentInstallSet.Invoke` | `POST` |
-| Monitor the apply | `/redfish/v1/UpdateService/UpdateTaskQueue/` | `GET` |
+| Component repository (what's uploaded) | `/redfish/v1/UpdateService/ComponentRepository?$expand=.` | `GET` |
+| Add a component by URI (iLO pulls) | `…/Actions/Oem/Hpe/HpeiLOUpdateServiceExt.AddFromUri` | `POST` |
+| List / create install sets | `/redfish/v1/UpdateService/InstallSets` | `GET` / `POST` |
+| Invoke a specific set | `…/InstallSets/{id}/Actions/HpeComponentInstallSet.Invoke` | `POST` |
+| Monitor the apply | `/redfish/v1/UpdateService/UpdateTaskQueue` | `GET` |
 
-(iLO also exposes the collection at the shorter alias
-`/redfish/v1/UpdateService/InstallSets/`, which `ilorest` uses; the `Oem/Hpe/` form
-is canonical. Read the `Invoke` target from the set's own
-`Actions["#HpeComponentInstallSet.Invoke"]["target"]` rather than hard-coding it.)
+**Path note (device-checked, §8.4):** on the live iLO the collections resolve to the
+paths above (no `Oem/Hpe/` segment); `…/Oem/Hpe/InstallSets` returns **404**. Always
+follow the `@odata.id` from the UpdateService root, and read the invoke target from
+the set's own `Actions["#HpeComponentInstallSet.Invoke"]["target"]`.
 
-**The Install Set body** (`POST` to the collection) — an ordered `Sequence` of steps,
-each an `ApplyUpdate` (or a control step). This is the artifact the controller builds
-from the manifest diff:
+**Step A — stage the component** (before it can be referenced). Two ways:
+
+- **`AddFromUri`** — iLO **pulls** it (nicest for a controller; host the `.fwpkg` on
+  HTTP(S)):
+  ```jsonc
+  POST …/Actions/Oem/Hpe/HpeiLOUpdateServiceExt.AddFromUri
+  {
+    "ImageURI":         "https://<repo>/22_49_1014-MCX623106AS-CDA_Ax.pldm.fwpkg",
+    "CompSigURI":       "https://<repo>/…compsig",   // optional; omit for embedded-signature FWPKG-v2
+    "UpdateRepository": true,      // keep the component in the iLO Repository (so an Install Set can reference it)
+    "UpdateTarget":     false,     // false = stage only (do NOT flash now); true = flash immediately
+    "TPMOverride":      false
+  }
+  ```
+  `UpdateRepository:true, UpdateTarget:false` = **stage without applying** — the
+  behaviour a controller wants (assemble the whole set, then invoke). This is also how
+  the reboot stays gated: nothing flashes until `Invoke`.
+- **Multipart push** to `/cgi-bin/uploadFile` (the older `flashfwpkg` path); >32 MiB
+  components upload in sequential chunks (`ComponentFileName` + `Section`).
+
+**Step B — create the Install Set** (`POST …/InstallSets`). An ordered `Sequence`; each
+step is an `ApplyUpdate` (referencing an uploaded component by `Filename`) or a control
+step. Full step schema (from the `ilorest` documented example):
 
 ```jsonc
-POST /redfish/v1/UpdateService/Oem/Hpe/InstallSets/
+POST /redfish/v1/UpdateService/InstallSets
 {
   "Name":        "maintenance-operator-<server>-<spp-version>",
   "Description": "SPP 2026.07 firmware baseline",
   "IsRecovery":  false,
   "Sequence": [
-    { "Name": "nic-bcm",  "Command": "ApplyUpdate", "Filename": "bcm237.1.148000.Optimized.HPb", "WaitTimeSeconds": 0 },
-    { "Name": "raid",     "Command": "ApplyUpdate", "Filename": "<component>.fwpkg" },
-    { "Name": "sysrom",   "Command": "ApplyUpdate", "Filename": "<systemrom>.fwpkg" },
-    { "Name": "reboot",   "Command": "ResetServer" }        // control step; also ResetBmc, Wait
+    { "Name": "connectx6", "UpdatableBy": ["Bmc"],  "Command": "ApplyUpdate",
+      "Filename": "22_49_1014-MCX623106AS-CDA_Ax.pldm.fwpkg" },
+    { "Name": "sysrom",    "UpdatableBy": ["Bmc"],  "Command": "ApplyUpdate",
+      "Filename": "U59_2.22_06_19_2024.signed.flash" },
+    { "Name": "settle",    "Command": "Wait",       "WaitTimeSeconds": 60 },
+    { "Name": "reboot",    "Command": "ResetServer" }
   ]
 }
 ```
 
-- Each `Sequence` step's `Filename` must match a component **already uploaded** to
-  `ComponentRepository` (step 6 upload precedes set creation).
-- `Command` ∈ `ApplyUpdate` | `ResetServer` | `ResetBmc` | `Wait` (+ `WaitTimeSeconds`).
-  So the controller encodes ordering and the reboot points **itself**, driven by the
-  manifest's `Order` and `ResetRequired` fields (§3.2) — this is the "sequencing
-  intelligence" that on Lenovo lives inside XCC.
-- After creation, **`POST … Actions/HpeComponentInstallSet.Invoke`** kicks off the
-  apply; iLO then executes the sequence and reboots per the control steps. Track via
-  `UpdateTaskQueue`.
+- **`Command`** ∈ **`ApplyUpdate`** (needs `Filename`) | **`ResetServer`** |
+  **`ResetBmc`** | **`Wait`** (needs `WaitTimeSeconds`). (Source-verified enum from
+  `MakeInstallSetCommand.py`.) So the controller encodes ordering and the reboot/settle
+  points **itself** in the `Sequence`, from the manifest's `Order`/`ResetRequired` and
+  the repo component's `Activates` (§8.6) — the "sequencing intelligence" that on
+  Lenovo lives inside XCC.
+- Each `ApplyUpdate` `Filename` must match a component already in `ComponentRepository`
+  (its `Filename`, step A).
+
+**Step C — invoke** (`POST …/InstallSets/{id}/Actions/HpeComponentInstallSet.Invoke`).
+Optional parameters:
+
+```jsonc
+POST …/InstallSets/{id}/Actions/HpeComponentInstallSet.Invoke
+{
+  "ClearTaskQueue":    true,             // clear the UpdateTaskQueue before enqueuing this set
+  "MaintenanceWindow": "<window-id>"     // optional — defer execution to a scheduled window
+}
+```
+
+iLO then enqueues the sequence into `UpdateTaskQueue` and executes it (immediately, or
+at the maintenance window), rebooting per the control steps. Track via the task
+queue / TaskService `TaskState`.
 
 **So the division is:** controller = *select + order + upload + assemble the set*;
 iLO = *apply the set atomically, in order, with reboots*. iLO takes care of the
@@ -365,18 +403,22 @@ SPP** for the host (the `firmware-baseline-oci.md` per-model resolution).
 
 ## 9. Remaining open items (live-device details)
 
-- The exact `ComponentRepository` **upload/`AddFromUri`** contract for FWPKG-v2
-  (headers; whether the `.json` sidecar / a `.compsig` is required) — the apply path
-  itself (§7a) is settled.
-- The `InstallSet` **status/result** shape during `Invoke` (per-step success/failure
-  in `UpdateTaskQueue`), and whether a failed step aborts the sequence
-  (`BundleUpdateReport/Current` and `/Completed` collections exist for this).
-- **Maintenance Window** binding to an Install Set for a scheduled apply
-  (`/redfish/v1/UpdateService/MaintenanceWindows`).
-- How `UpdatableBy: ["Uefi"]` deferral / `Activates` (`Immediately` /
-  `AfterReboot` / `AfterDeviceReset` / `AfterHardPowerCycle`) maps to the reboot the
-  controller must gate — the `Activates` field (seen per repo component) is the
-  authoritative reboot signal at apply time.
+The apply path is now **fully specified** (§7a): `AddFromUri` (stage) → `InstallSets`
+create → `HpeComponentInstallSet.Invoke` (with `ClearTaskQueue`/`MaintenanceWindow`)
+→ `UpdateTaskQueue` monitor, with the `Sequence`/`Command` schema and the `AddFromUri`
+payload source-verified. What still needs a live run to nail down:
+
+- The **per-task status shape** in `UpdateTaskQueue` during execution (the `TaskState`
+  values, and whether a failed `ApplyUpdate` step aborts the rest of the sequence) —
+  `BundleUpdateReport/Current` and `/Completed` are the result views to poll.
+- Confirm `AddFromUri` **`UpdateRepository:true, UpdateTarget:false`** stages without
+  flashing on the target iLO generation (expected from the schema; verify on device).
+- **Maintenance Window** creation + how its id binds into the `Invoke` payload for a
+  scheduled apply.
+- Empirical **ordering rules** iLO enforces vs. what the controller must impose in the
+  `Sequence` (e.g. iLO/BMC before UEFI) — the manifest `Prerequisites` and the repo
+  `Activates` field drive this, but the exact iLO-enforced constraints are worth
+  confirming.
 
 ## 10. References
 
@@ -387,6 +429,8 @@ SPP** for the host (the `firmware-baseline-oci.md` per-model resolution).
   <https://github.com/szeidat/SPPCmdlets>
 - HPE OneView firmware baseline / SPT:
   <https://www.hpe.com/psnow/resources/ebooks/a00115977en_us_v4/s_profiles-about-firmware.html>
+- HPE Server Management Portal — firmware updates via Redfish, part 3 (Install Sets,
+  `AddFromUri`, Invoke): <https://servermanagementportal.ext.hpe.com/docs/references_and_material/blogposts/firmware_updates/part3/firmware_update_part3>
 - Companions: [lenovo-redfish-updatefromrepository.md](lenovo-redfish-updatefromrepository.md),
   [dell-install-from-repository.md](dell-install-from-repository.md),
   [hpe-ilo-flashfwpkg.md](hpe-ilo-flashfwpkg.md).
