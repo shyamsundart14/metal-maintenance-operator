@@ -345,6 +345,101 @@ mis-wiring the controller to it, and because its reboot-into-a-boot-environment
 behaviour is relevant to the live-ESXi reboot/boot-source concern (a host must not
 be left in the BMU/PXE environment).
 
+## 5a. Reboot orchestration — workload-agnostic, via `ServerMaintenance` (ESXi / KVM / bare-metal Linux)
+
+`UpdateFromRepository` **has no reboot-control parameter** (§2) — the payload is only
+`RepoURI` (+ creds); XCC decides per component from the bundle's `ActivationMethod`
+(§3b.3: 28 of 305 components in the sample bundle were `System reboot`, one was
+`AC power cycle`). So the controller cannot defer or suppress the reboot through the
+API. **It must instead ensure the host is safe to reboot *before* it POSTs**, and it
+must do so **without knowing what runs on the host** (ESXi, a KVM hypervisor, or a
+bare-metal Kubernetes worker).
+
+metal-operator already provides exactly this gate, and **Dell PR #170 already uses
+it** — so the Lenovo controller follows the same pattern rather than inventing one.
+
+### 5a.1 The gate: `ServerMaintenance` + owner-approval handshake
+
+The gate is metal-operator's **`ServerMaintenance`** resource
+(`metal.ironcore.dev`, short name `sm`) plus a **`ServerMaintenancePolicy`**:
+
+| Policy | Behaviour |
+|---|---|
+| `OwnerApproval` | metal-operator marks the bound `ServerClaim` with `metal.ironcore.dev/maintenance-needed=true` and **blocks** until the workload owner drains and sets `metal.ironcore.dev/maintenance-approved=true`. Safe default for live hosts. |
+| `Enforced` | proceeds **without** approval (optional higher `Priority` to jump the queue). For already-drained / spare servers only. |
+
+Key `ServerMaintenanceSpec` fields (metal-operator v0.6.0): `ServerRef` (required),
+`Policy`, `ServerPower`, `Priority`, `ServerBootConfigurationTemplate`. Status is a
+single `State`: `Pending → InMaintenance → Failed`. When granted, the Server's own
+`Status.State` becomes `Maintenance` and `Server.Spec.ServerMaintenanceRef` is set.
+
+**Crucially, this is a *handshake, not an active drain*.** metal-operator does **not**
+evacuate the workload itself (its `Server.Spec.Taints` / `TaintEffectEvict` is defined
+but explicitly a **no-op** today — "reserved for future use"). The actual
+drain/evacuation is done by **whoever owns the `ServerClaim`**, out-of-band, and then
+signalled with the `maintenance-approved` label. That indirection is what makes it
+workload-agnostic.
+
+### 5a.2 Where ESXi / KVM / bare-metal differ — only in the approver
+
+The firmware controller is identical for all three. Only the **approver** — the actor
+that drains and then sets `maintenance-approved` — changes:
+
+| Host type | Is it a K8s Node? | Drain step performed by the approver | Taints/tolerations? |
+|---|---|---|---|
+| **Bare-metal Linux K8s worker** | Yes | `kubectl drain` = cordon + `NoExecute` taint; DaemonSets kept via tolerations; honour PodDisruptionBudgets | **Yes — here.** This is the one case where K8s taints/tolerations do the work |
+| **ESXi host** | No (not a Node) | vCenter: enter maintenance mode / DRS-evacuate VMs | No — vCenter drains |
+| **KVM / libvirt host** | No (not a Node) | live-migrate or gracefully stop VMs | No — libvirt drains |
+
+So Kubernetes taints/tolerations are **one drainer implementation** (the bare-metal
+worker case), *not* the universal mechanism — the universal contract is the
+`maintenance-approved` label on the `ServerClaim`.
+
+> Self-relaxing case: if a Server has **no `ServerClaimRef`** (unclaimed / idle /
+> spare), metal-operator grants maintenance **immediately even under
+> `OwnerApproval`** — there is no workload to protect. Spare capacity updates without
+> a manual approve.
+
+### 5a.3 The controller flow (mirrors Dell PR #170)
+
+1. **Dry-run, ungated.** Run `GetRepoUpdateDetail` (Lenovo) — read-only, never
+   reboots, so it needs **no** `ServerMaintenance`. (Dell PR #170 does the same: its
+   `RepositoryCheck` runs with `ApplyUpdate=false, RebootNeeded=false`.)
+2. **Only if packages are pending**, create a `ServerMaintenance`
+   (`ServerRef` = target, `Policy` from the CR spec, owner-referenced to the
+   FirmwareUpdate CR).
+3. **Gate the apply.** Block until `Server.Status.State == Maintenance` (exactly Dell
+   PR #170's `handleServerMaintenance`, which refuses to proceed until
+   `server.Status.State == ServerStateMaintenance`). Surface a
+   `Waiting-for-approval` condition meanwhile.
+4. **(Optional) stabilise the BMC** — PR #170 issues a BMC reset here to avoid BMCs
+   that hang on subsequent operations (`GracefulRestartBMC`), then waits for the
+   operation annotation to clear.
+5. **POST `UpdateFromRepository`.** The reboot now happens on a drained host. (Dell
+   ties `RebootNeeded = ApplyUpdate`, i.e. reboot is on for the apply pass only.)
+6. **Track the Task/job to convergence**, then **delete the `ServerMaintenance`** —
+   metal-operator cleans up the `maintenance-needed` / `maintenance-approved` labels
+   and the owner restores its workload.
+
+### 5a.4 CRD shape to mirror (from Dell `FirmwareUpdateDell`)
+
+PR #170's `FirmwareUpdateDellSpec` carries the maintenance wiring the Lenovo CR
+should copy — and deliberately **no** `rebootPolicy` / `applyTime` / `maintenanceWindow`
+field (reboot is hardcoded on for the apply pass, gated by maintenance instead):
+
+```go
+// ServerMaintenanceRef references the ServerMaintenance the controller requested.
+ServerMaintenanceRef   *metalv1alpha1.ObjectReference          // +optional
+// ServerMaintenancePolicy — OwnerApproval | Enforced — enforced on the server.
+ServerMaintenancePolicy *maintenancev1alpha1.ServerMaintenancePolicy // +optional
+// ServerRef — the server to update (immutable).
+ServerRef              *corev1.LocalObjectReference            // +required
+```
+
+**Net:** the firmware controller stays hypervisor-blind — request `ServerMaintenance`,
+wait for `Maintenance` state, POST, delete — and the ESXi / KVM / K8s-worker specifics
+live entirely in the **approver** that satisfies the `maintenance-approved` handshake.
+
 ## 6. Correction of the earlier conclusion
 
 An earlier analysis ([lenovo-xcc-repository.md](lenovo-xcc-repository.md) §1)
@@ -382,10 +477,18 @@ fully surfaced in public documentation; querying a real device is authoritative.
   the OCI-baseline granularity in [firmware-baseline-oci.md](firmware-baseline-oci.md):
   `RepoURI` would point at the per-model repo the controller resolves from the
   host's `kubernetes.metal.cloud.sap/type` label.
-- **Reboot / boot-source** remains the open production concern (live ESXi):
-  repository updates reboot the host, and the `BareMetal` path can boot into a
-  non-disk environment — the controller must guarantee the host returns to its
-  production OS (the same boot-from-disk requirement as
+- **Reboot orchestration is solved by `ServerMaintenance` (§5a)** — not by an API
+  parameter (there is none). The controller requests a `ServerMaintenance`
+  (`OwnerApproval` for live hosts, `Enforced` for drained/spare), waits for
+  `Server.Status.State == Maintenance`, then POSTs — the exact Dell PR #170 pattern.
+  This makes reboot handling **workload-agnostic** (ESXi / KVM / bare-metal K8s
+  worker): the per-workload drain lives in whatever **approves** the maintenance, and
+  K8s taints/tolerations are only the bare-metal-worker drainer, not the universal
+  mechanism.
+- **Boot-source** remains a production concern (live ESXi): repository updates reboot
+  the host and the `BareMetal` path can boot into a non-disk environment — the
+  controller (and metal-operator's maintenance boot config) must guarantee the host
+  returns to its production OS (the boot-from-disk requirement in
   [firmware-update-design.md](firmware-update-design.md) §7a).
 - **Licensing is a hard prerequisite (§3a).** The repository path needs XCC
   **Enterprise (gen 1) / Platinum (XCC2, V3) / Premier (XCC3, V4)** depending on the
