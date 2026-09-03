@@ -65,12 +65,87 @@ For a target server whose model/generation selects the matching SPP:
 for each FirmwareInventory member M:
     if not M.Updateable: continue                       # iLO says not OOB-flashable
     for T in M.Oem.Hpe.Targets:
-        C = manifest component where T in C.Devices.Device[].Target
-        if C and version_gt(C.Version, M.Version):       # newer available
-            add C to update_set  (dedup by Target)
-# update_set → stage each C payload → build InstallSet Sequence
+        # A Target can be claimed by >1 manifest component (a firmware image AND an
+        # OS-driver package). Keep only the out-of-band firmware candidate:
+        candidates = [C in manifest.Components
+                      if T in C.Devices.Device[].Target
+                      and C.UpdatableBy ⊆ {Bmc, Uefi}          # drop RuntimeAgent (needs iSUT)
+                      and C.PackageFormat in {FWPKG-v2, FWPKG}] # firmware image, not .exe/.rpm
+        C = best(candidates)     # prefer Type Firmware > ComboFirmware, then newest Version
+        if C and version_gt(C.Device[T].Version, M.Version):    # newer available
+            file = resolve_on_disk(C.Device[T].FirmwareImages[].FileName)  # stem-match, see §2a
+            add (Target=T, component=C, file=file) to update_set   # dedup by Target
+# update_set → stage each file → build InstallSet Sequence
 #            → order by prerequisites/ResetRequired → Invoke → poll UpdateTaskQueue
 ```
+
+**Picking the fwpkg is a lookup, not a guess:** you never match on device name or
+filename — you join on the **`Target` GUID**, filter the matching components to the
+out-of-band firmware one, version-compare, and only *then* read that component's
+`FileName` to resolve the payload. The filename is the output of the lookup. §2a
+walks a real ConnectX-6 through it.
+
+## 2a. Worked example — picking the fwpkg for a ConnectX-6 adapter
+
+The ConnectX-6 is the most common adapter across the HPE fleet, so it is the
+canonical example. **There is no single "ConnectX-6 fwpkg":** the Gen10 SPP 2026.07
+manifest contains **10+ distinct ConnectX-6 variants**, each a different card with its
+own `Target` GUID and its own payload — for example:
+
+| Card | `Target` GUID | Version | fwpkg (on disk) |
+|---|---|---|---|
+| Ethernet 100Gb 2p MCX623106AS-CDAT | `a6b1a447-382a-5a4f-15b3-101d15b30042` | 22.49.1014 | `22_49_1014-MCX623106AS-CDA_Ax.pldm.fwpkg` |
+| Ethernet 200Gb 1p MCX623105AS-VDAT | `a6b1a447-382a-5a4f-15b3-101d15b30040` | 22.49.1014 | `22_49_1014-MCX623105AS-VDA_Ax.pldm.fwpkg` |
+| IB HDR/EN 200Gb 1p OCP3 MCX653435A-HDA | `a6b1a447-382a-5a4f-15b3-101b15900347` | 20.43.8004 | `20_43_8004-MCX653435A-HDA_HPE_Ax.pldm.fwpkg` |
+| IB HDR/EN 200Gb 2p MCX653106A-HDA | `a6b1a447-382a-5a4f-15b3-101b15900345` | 20.43.8004 | `20_43_8004-MCX653106A-HDA_HPE_Ax.pldm.fwpkg` |
+| MCX631102AS 25GbE 2p | `a6b1a447-382a-5a4f-15b3-101f15b30012` | 26.49.1014 | `26_49_1014-MCX631102AS-ADA_Ax.pldm.fwpkg` |
+| … (10+ total) | … | … | … |
+
+Picking the wrong variant would flash the wrong firmware, so the **`Target` GUID is
+the only safe key** — never the name "ConnectX-6".
+
+**Trace** for the `MCX623106AS-CDAT` card (this is the exact adapter present on the
+live iLO 6 we queried, at inventory members `/24` and `/25`):
+
+```text
+1. GET FirmwareInventory/24
+     Oem.Hpe.Targets = ["a6b1a447-382a-5a4f-15b3-101d15b30042"]   ← the card's identity
+     Version         = "22.49.1014"                               ← installed
+     Updateable      = true
+
+2. Join: manifest component whose Devices.Device[].Target == that GUID
+     DeviceName    = "HPE Ethernet 100Gb 2-port QSFP56 MCX623106AS-CDAT Adapter"
+     UpdatableBy   = ["Bmc"]          ✓ out-of-band  (keep)
+     PackageFormat = "FWPKG-v2"       ✓ firmware image (keep)
+     Type          = "Firmware"       ✓
+     Version       = "22.49.1014"
+     FileName      = "22_49_1014-MCX623106AS-CDA_Ax.pldm.signed"
+
+3. Version compare: available 22.49.1014 vs installed 22.49.1014  → EQUAL → skip
+   (On the live box it was already current — the correct no-op. Had the installed
+    version been older, this component would be selected.)
+
+4. Resolve FileName → on-disk payload:
+     manifest FileName:  22_49_1014-MCX623106AS-CDA_Ax.pldm.signed
+     on disk / repo:     22_49_1014-MCX623106AS-CDA_Ax.pldm.fwpkg
+     → MATCH ON STEM (…pldm), not literal — the suffix differs (.signed vs .fwpkg).
+```
+
+**Two rules this example nails down:**
+
+1. **`FileName` ≠ the on-disk file, exactly.** The manifest reports `…pldm.signed`;
+   the actual payload is `…pldm.fwpkg` (verified in the SPP `packages/` dir). Resolve
+   by **stem match** (`20_43_8004-MCX653435A-HDA_HPE_Ax.pldm`,
+   `22_49_1014-MCX623106AS-CDA_Ax.pldm`), never string equality.
+2. **The `Target` embeds the PCI identity** — `…15b3-101d…` = `15b3` (NVIDIA/Mellanox
+   vendor) + device/subsystem. This is why two physically-identical cards
+   (inventory `/24` and `/25`) share one `Target`, one manifest component, and one
+   fwpkg — the diff **dedups by `Target`** so the Install Set lists it once.
+
+For all ConnectX-6 variants here `UpdatableBy=[Bmc]` and `PackageFormat=FWPKG-v2`, so
+the candidate filter is a clean pass. The filter earns its keep on devices (e.g. some
+Broadcom NICs) that *also* ship a `RuntimeAgent` `.exe`/`.rpm` driver component under
+the same `Target` — there the filter drops the driver and keeps the `Bmc` firmware.
 
 ## 3. The iLO batch-apply mechanism (Install Set)
 
