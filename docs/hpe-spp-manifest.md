@@ -203,9 +203,66 @@ reading the JSON manifest and driving iLO. Concretely:
    reboot orchestration as Lenovo/Dell (see
    [lenovo-redfish-updatefromrepository.md](lenovo-redfish-updatefromrepository.md) §5a).
 6. **Upload** each applicable `.fwpkg` to iLO `ComponentRepository`, **build an
-   Install Set**, and apply (the
-   [hpe-ilo-flashfwpkg.md](hpe-ilo-flashfwpkg.md) `UpdateTaskQueue`/`InstallSets`
-   flow). Optionally schedule via a maintenance window.
+   Install Set**, and **invoke it** (§7a). Optionally schedule via a maintenance
+   window.
+
+### 7a. The InstallSet batch mechanism — who does what
+
+**Question: "will iLO upgrade all the components from the manifest, or must we do
+something?" Answer: we build the set; iLO applies it.** iLO has **no** concept of the
+SPP manifest — it never reads `manifest.json`. What iLO *does* provide is a
+first-class **batch-apply** primitive: the **HPE Install Set**. The controller
+assembles the set from the manifest diff, and iLO then applies the whole set —
+ordered, with reboots, atomically.
+
+Source-verified from `ilorest` (`MakeInstallSetCommand.py` / `InstallSetCommand.py`)
+and confirmed against the iLO OEM `UpdateService`:
+
+| Purpose | Endpoint | Method |
+|---|---|---|
+| Component repository (what's uploaded) | `/redfish/v1/UpdateService/ComponentRepository/?$expand=.` | `GET` |
+| List / create install sets | `/redfish/v1/UpdateService/Oem/Hpe/InstallSets/` | `GET` / `POST` |
+| Invoke a specific set | `…/Oem/Hpe/InstallSets/{id}/Actions/HpeComponentInstallSet.Invoke` | `POST` |
+| Monitor the apply | `/redfish/v1/UpdateService/UpdateTaskQueue/` | `GET` |
+
+(iLO also exposes the collection at the shorter alias
+`/redfish/v1/UpdateService/InstallSets/`, which `ilorest` uses; the `Oem/Hpe/` form
+is canonical. Read the `Invoke` target from the set's own
+`Actions["#HpeComponentInstallSet.Invoke"]["target"]` rather than hard-coding it.)
+
+**The Install Set body** (`POST` to the collection) — an ordered `Sequence` of steps,
+each an `ApplyUpdate` (or a control step). This is the artifact the controller builds
+from the manifest diff:
+
+```jsonc
+POST /redfish/v1/UpdateService/Oem/Hpe/InstallSets/
+{
+  "Name":        "maintenance-operator-<server>-<spp-version>",
+  "Description": "SPP 2026.07 firmware baseline",
+  "IsRecovery":  false,
+  "Sequence": [
+    { "Name": "nic-bcm",  "Command": "ApplyUpdate", "Filename": "bcm237.1.148000.Optimized.HPb", "WaitTimeSeconds": 0 },
+    { "Name": "raid",     "Command": "ApplyUpdate", "Filename": "<component>.fwpkg" },
+    { "Name": "sysrom",   "Command": "ApplyUpdate", "Filename": "<systemrom>.fwpkg" },
+    { "Name": "reboot",   "Command": "ResetServer" }        // control step; also ResetBmc, Wait
+  ]
+}
+```
+
+- Each `Sequence` step's `Filename` must match a component **already uploaded** to
+  `ComponentRepository` (step 6 upload precedes set creation).
+- `Command` ∈ `ApplyUpdate` | `ResetServer` | `ResetBmc` | `Wait` (+ `WaitTimeSeconds`).
+  So the controller encodes ordering and the reboot points **itself**, driven by the
+  manifest's `Order` and `ResetRequired` fields (§3.2) — this is the "sequencing
+  intelligence" that on Lenovo lives inside XCC.
+- After creation, **`POST … Actions/HpeComponentInstallSet.Invoke`** kicks off the
+  apply; iLO then executes the sequence and reboots per the control steps. Track via
+  `UpdateTaskQueue`.
+
+**So the division is:** controller = *select + order + upload + assemble the set*;
+iLO = *apply the set atomically, in order, with reboots*. iLO takes care of the
+**apply**, not the **selection** — the opposite balance to Lenovo, where XCC does
+both from a single `RepoURI`.
 
 ### What is reusable vs new
 
@@ -213,17 +270,26 @@ reading the JSON manifest and driving iLO. Concretely:
   (`Pending → InProgress → Completed/Failed`, dry-run → gate → apply → track) — same
   skeleton as the `FirmwareUpdateLenovo` scaffold.
 - **Reusable logic:** the manifest-diff (now proven to have the needed fields).
-- **New, HPE-specific:** parse `metadata.json`; upload to `ComponentRepository`; build
-  the Install Set; the FWPKG-v2 signature handling (§5).
+- **New, HPE-specific:** parse `metadata.json`; upload to `ComponentRepository`;
+  assemble + invoke the Install Set (§7a); the FWPKG-v2 signature handling (§5).
 
 ## 8. Open items to confirm on a live iLO
 
+The **apply path is now settled** (§7a): `ComponentRepository` upload →
+`Oem/Hpe/InstallSets/` create → `HpeComponentInstallSet.Invoke` → `UpdateTaskQueue`
+monitor. Remaining, all live-device details:
+
 - `GET /redfish/v1/UpdateService` + JsonSchemas: confirm **no** SPP/manifest-ingest
-  OEM action (§6), and the exact `ComponentRepository` upload contract for FWPKG-v2.
-- Install Set + Maintenance Window response/status shape for atomic multi-component
-  apply.
+  OEM action (§6), and the exact `ComponentRepository` **upload** contract for
+  FWPKG-v2 (multipart endpoint/headers; whether the `.json` sidecar or a `.compsig`
+  is required per iLO generation).
+- The `InstallSet` **status/result** shape during `Invoke` (per-step success/failure
+  in `UpdateTaskQueue`), and whether a failed step aborts the sequence.
+- **Maintenance Window** attachment for a scheduled/atomic apply (the
+  `/redfish/v1/UpdateService/Oem/Hpe/MaintenanceWindows/` collection) and how it binds
+  to an Install Set.
 - How `UpdatableBy: ["Uefi"]` deferral surfaces (applied at next boot) in the task
-  queue.
+  queue / whether a `ResetServer` control step is required to activate it.
 
 ## 9. References
 
