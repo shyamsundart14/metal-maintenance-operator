@@ -52,9 +52,11 @@ For a target server whose model/generation selects the matching SPP:
    component's `Activates` (device) → gate a **`ServerMaintenance`**
    (`OwnerApproval`/`Enforced`) — the vendor-neutral reboot orchestration shared with
    Lenovo/Dell (see [lenovo-redfish-updatefromrepository.md](lenovo-redfish-updatefromrepository.md) §5a).
-4. **Stage** each applicable `.fwpkg` into the iLO `ComponentRepository` (§3, step A).
+4. **Stage** each applicable `.fwpkg` into the iLO `ComponentRepository` (§3, step A),
+   respecting the **~1 GB repo budget** (§4 — stream per component, or wave-batch).
 5. **Assemble + invoke** an Install Set (§3, steps B–C); iLO applies the ordered set
-   and reboots per the control steps.
+   and reboots per the control steps. (Or, under Strategy A, flash per component as it
+   is staged — §4.3.)
 6. **Track** `UpdateTaskQueue` to convergence; re-run the dry-run to confirm.
 
 ### Dry-run diff algorithm
@@ -144,17 +146,99 @@ iLO enqueues the sequence into `UpdateTaskQueue` and executes it (immediately, o
 the maintenance window), rebooting per the control steps. Track via the task queue /
 TaskService `TaskState`.
 
-## 4. Reusable vs new
+## 4. Repository size limit & the many-component strategy
+
+The iLO `ComponentRepository` is **small and bounded** — the staging shelf, not a
+bulk store. This directly constrains how many components can be in flight, so the
+controller must handle it explicitly.
+
+### 4.1 The limit (read it from the device — do not hard-code)
+
+`GET /redfish/v1/UpdateService/ComponentRepository` reports the budget under
+`Oem.Hpe`:
+
+```jsonc
+"ComponentCount": 8,
+"TotalSizeBytes": 1073168384,   // ~1.0 GB total on the live iLO 6 (Gen11) checked
+"FreeSizeBytes":  972914688     // free right now
+```
+
+- The ceiling is **~1 GB on the iLO 6 examined**, but it **varies by iLO generation /
+  firmware** — the controller must read `TotalSizeBytes`/`FreeSizeBytes` live, never
+  assume 1 GB.
+- **`FreeSizeBytes`, not total, is what matters:** components already in the repo can
+  be `Locked: true` (part of a persistent Install Set or the recovery set) and cannot
+  be evicted — on the live box all 8 were locked. Always size against *free* space.
+- Individual components **> 32 MiB** upload in chunks (multipart `ComponentFileName` +
+  `Section`); `AddFromUri` handles large files by having iLO pull them.
+
+### 4.2 Why this is usually a non-issue — diff first
+
+**Stage the diff, not the SPP.** After the version comparison (§2) the set is only the
+components actually out-of-date on *this* server — typically a handful (a few hundred
+MB), not the full ~126-`.fwpkg` SPP. For most updates the diff fits comfortably in
+1 GB and none of the below triggers. The strategies matter only for a very-behind
+server whose applicable set exceeds free space.
+
+### 4.3 Strategy A (default) — stream per component: pull → flash → free
+
+Sidesteps the limit almost entirely. Instead of staging the whole set then invoking,
+have iLO fetch-flash-discard **one component at a time**:
+
+```jsonc
+POST …/Actions/Oem/Hpe/HpeiLOUpdateServiceExt.AddFromUri
+{
+  "ImageURI":         "https://<repo>/component.fwpkg",
+  "UpdateTarget":     true,     // flash now
+  "UpdateRepository": false     // do NOT retain in the repo afterwards
+}
+```
+
+The repo only ever holds one component, so the size ceiling is irrelevant. The
+controller sequences the components itself (it already computed the order) and inserts
+reboots per `ResetRequired`/`Activates`. **Trade-off:** you give up the single atomic
+Install Set and its maintenance-window scheduling — the controller owns the
+sequencing. This is the recommended default because it removes size as a constraint.
+
+### 4.4 Strategy B — size-bounded Install Set waves
+
+Keep the atomic Install Set model, but if the applicable set exceeds free space, split
+it into waves that each fit:
+
+```text
+applicable set (e.g. 2.5 GB)
+  wave 1: stage components up to ~free-space → InstallSet → Invoke → wait → reclaim
+  wave 2: next batch → InstallSet → Invoke → wait → reclaim
+  wave 3: remainder
+```
+
+Order waves so reboot-requiring components cluster (from `ResetRequired`/`Order`), to
+minimise reboots. Use this when the atomic-set or maintenance-window semantics are
+wanted for a batch.
+
+### 4.5 Space reclamation (both strategies need it)
+
+Before staging (each component in A, each wave in B): `GET ComponentRepository`, and if
+`FreeSizeBytes` is insufficient, evict unlocked components:
+
+- **`…/Actions/Oem/Hpe/HpeiLOUpdateServiceExt.DeleteUnlockedComponents`** — clears
+  staged components not locked into an Install Set / recovery set.
+- **`…/HpeiLOUpdateServiceExt.DeleteUpdateTaskQueueItems`** — clears the queue.
+
+Then re-read `FreeSizeBytes` and stage only what fits. Locked components cannot be
+reclaimed, so the controller plans against the free remainder.
+
+## 5. Reusable vs new
 
 - **Reusable as-is:** the `ServerMaintenance` reboot-gating and the CRD state-machine
   shape (`Pending → InProgress → Completed/Failed`, dry-run → gate → apply → track) —
   the same skeleton as the `FirmwareUpdateLenovo` scaffold.
 - **Reusable logic:** the manifest-diff (proven to have the needed fields).
 - **New, HPE-specific:** parse `metadata.json`; `AddFromUri`/upload to
-  `ComponentRepository`; assemble + invoke the Install Set; FWPKG-v2 signature
-  handling.
+  `ComponentRepository`; **manage the ~1 GB repo budget (§4)**; assemble + invoke the
+  Install Set; FWPKG-v2 signature handling.
 
-## 5. Open items (live-device details)
+## 6. Open items (live-device details)
 
 The apply path is fully specified above. What still needs a live run to finalise:
 
@@ -162,14 +246,18 @@ The apply path is fully specified above. What still needs a live run to finalise
   values; whether a failed `ApplyUpdate` aborts the rest of the sequence) —
   `BundleUpdateReport/Current` and `/Completed` are the result views to poll.
 - Confirm `AddFromUri` **`UpdateRepository:true, UpdateTarget:false`** stages without
-  flashing on the target iLO generation.
+  flashing, and **`UpdateTarget:true, UpdateRepository:false`** flashes without
+  retaining (Strategy A, §4.3), on the target iLO generation.
+- **Repo budget per iLO generation** — `TotalSizeBytes` on iLO 5 vs iLO 6 (read live);
+  confirm `DeleteUnlockedComponents` reclaims as expected and how locked/recovery-set
+  components reduce usable space (§4.5).
 - **Maintenance Window** creation and how its id binds into the `Invoke` payload.
 - The exact `AddFromUri`/upload **signature** requirement for FWPKG-v2 per iLO
   generation (iLO 5 vs iLO 6/Gen11).
 - Empirical **ordering rules** iLO enforces vs. what the controller must impose in the
   `Sequence` (e.g. iLO/BMC before UEFI).
 
-## 6. References
+## 7. References
 
 - Evidence and schema behind this approach: [hpe-firmware-findings.md](hpe-firmware-findings.md).
 - HPE Server Management Portal — firmware updates via Redfish, part 3 (Install Sets,
