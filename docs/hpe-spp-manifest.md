@@ -169,7 +169,7 @@ older component formats), but for FWPKG-v2 the signature handling differs from t
 requirement per iLO generation (iLO 5 vs iLO 6/Gen11) should be confirmed on a live
 device before implementing the upload step.
 
-## 6. Does iLO ingest an SPP directly? (still: no evidence)
+## 6. Does iLO ingest an SPP directly? (No — confirmed on a live iLO, see §8.1)
 
 The ISO's `restful_api/` directory holds `rest-classes-bios-U*.zip` — these are
 **BIOS attribute registries / Redfish class definitions per ROM family**, *not* an
@@ -273,25 +273,112 @@ both from a single `RepoURI`.
 - **New, HPE-specific:** parse `metadata.json`; upload to `ComponentRepository`;
   assemble + invoke the Install Set (§7a); the FWPKG-v2 signature handling (§5).
 
-## 8. Open items to confirm on a live iLO
+## 8. Live-iLO verification (device-confirmed)
 
-The **apply path is now settled** (§7a): `ComponentRepository` upload →
-`Oem/Hpe/InstallSets/` create → `HpeComponentInstallSet.Invoke` → `UpdateTaskQueue`
-monitor. Remaining, all live-device details:
+Verified against a **live iLO 6 on a DL560 Gen11** (`GET /redfish/v1/UpdateService`
+and its sub-collections, `$expand=.`). This settles most of the earlier open items.
 
-- `GET /redfish/v1/UpdateService` + JsonSchemas: confirm **no** SPP/manifest-ingest
-  OEM action (§6), and the exact `ComponentRepository` **upload** contract for
-  FWPKG-v2 (multipart endpoint/headers; whether the `.json` sidecar or a `.compsig`
-  is required per iLO generation).
+### 8.1 No SPP-ingest action — confirmed
+
+`UpdateService.Actions` has only the standard `#UpdateService.SimpleUpdate`
+(HTTP/HTTPS). The HPE OEM actions are `AddFromUri`, `BundleUpdateForceStop`,
+`DeleteInstallSets`, `DeleteMaintenanceWindows`, `DeleteUnlockedComponents`,
+`DeleteUpdateTaskQueueItems`, `RemoveLanguagePack`, `SetDefaultLanguage`,
+`StartFirmwareIntegrityCheck`. **None ingest an SPP or a manifest** — confirming §6.
+The manifest diff + Install-Set assembly is the controller's job.
+
+### 8.2 `AddFromUri` — iLO can PULL components (softens "push-only")
+
+`#HpeiLOUpdateServiceExt.AddFromUri`
+(`…/Actions/Oem/Hpe/HpeiLOUpdateServiceExt.AddFromUri`) lets iLO **fetch a component
+from a URI** into the `ComponentRepository`, instead of the controller multipart-
+pushing each file to `/cgi-bin/uploadFile`. So the staging step can be "host the
+`.fwpkg`s on HTTP(S), tell iLO to pull each" — much closer to the Dell/Lenovo
+repo ergonomics for upload. (`SimpleUpdate` also allows HTTP/HTTPS.)
+
+### 8.3 Capabilities (from `Oem.Hpe.Capabilities`)
+
+`UpdateFWPKG: true`, `PLDMFirmwareUpdate: true`, **`StageBundleUpdateSupport: true`**
+(stage now / apply later — useful for reboot-gating), `BundleDowngradeSupport: true`
++ `DowngradePolicy: "AllowDowngrade"`, `BundleUpdateForceStopSupport: true`,
+`HostPoweroffSupport: true`, `OfflineRuntimeBundleUpdate: "ProductionMode"`.
+`ComponentRepository` has a **~1 GB budget** (`TotalSizeBytes` ~1.07 GB), so the
+controller must manage repo space (delete unlocked components when full).
+
+### 8.4 Collection paths — read from `@odata.id`, don't hard-code
+
+On this device the collections resolve to the **non-`Oem/Hpe`** paths:
+`/redfish/v1/UpdateService/InstallSets`, `/…/ComponentRepository`,
+`/…/UpdateTaskQueue`, `/…/MaintenanceWindows`, `/…/BundleUpdateReport`. A `GET` on
+`…/Oem/Hpe/InstallSets` returned **404**; the real link is published as
+`Oem.Hpe.InstallSets.@odata.id` in the UpdateService root. **Always follow the
+`@odata.id` from the root**, and read the Invoke target from the set's own
+`Actions["#HpeComponentInstallSet.Invoke"]["target"]`.
+
+### 8.5 The join key is `Target` (GUID) — confirmed end-to-end ★
+
+Every `FirmwareInventory` member carries `Oem.Hpe.Targets[]` (+ `DeviceClass`,
+`DeviceContext`, `DeviceInstance`), and every `ComponentRepository` component carries
+`Targets[]` + `Version` + `Filename`. The **same `Target` GUID** appears in the SPP
+`manifest.json` (`Devices.Device[].Target`), the live inventory, and the live repo —
+verified for a ConnectX-6 NIC across all three:
+
+```
+manifest.json   Target a6b1a447-382a-5a4f-15b3-101d15b30042  ver 22.49.1014  file 22_49_1014-MCX623106AS-CDA_Ax.pldm.signed  UpdatableBy[Bmc] ResetRequired
+FirmwareInvent. /24,/25  same Target                          ver 22.49.1014
+ComponentRepo   /440f0711 same Target                         ver 22.49.1014  file 22_49_1014-MCX623106AS-CDA_Ax.pldm.fwpkg
+```
+
+The GUID's middle bytes embed the PCI IDs (`15b3` = NVIDIA/Mellanox, `101d` = device),
+the same identity scheme as Lenovo's `AgentlessId`. **The diff joins on this GUID.**
+
+### 8.6 Two realities the live data added to the diff
+
+1. **`Updateable: true|false` per inventory member is the OOB-flashability authority.**
+   On this box, CPU microcode (S3M/PUcode), TPM, the Broadcom NIC and embedded video
+   report `Updateable: false` — even though an SPP ships those components. So the
+   controller must **filter to `Updateable: true`** from the inventory, which is a
+   sharper gate than the manifest's `UpdatableBy` alone.
+2. **Many devices share one `Target` → one payload updates N instances.** The 4 UBM
+   backplanes (inv /31–/34) and the paired ConnectX-6 NICs share a single `Target`.
+   The diff must **deduplicate by `Target`** so the Install Set lists each component
+   once.
+
+### 8.7 The device-confirmed diff algorithm
+
+```text
+for each FirmwareInventory member M:
+    if not M.Updateable: continue                       # iLO says not OOB-flashable
+    for T in M.Oem.Hpe.Targets:
+        C = manifest component where T in C.Devices.Device[].Target
+        if C and version_gt(C.Version, M.Version):       # newer available
+            add C to update_set  (dedup by Target)
+# update_set → (AddFromUri | push) each C payload → build InstallSet Sequence
+#            → order by prerequisites/ResetRequired → Invoke → poll UpdateTaskQueue
+```
+
+Applied to this box (repo vs inventory), nothing was newer than installed — the
+correct "already converged / no-op" dry-run result. **Generation matters:** the Gen10
+SPP's iLO/BIOS `Target`s did not match this Gen11 server (option cards like the
+ConnectX-6/NS204i did), so the controller must resolve the **matching-generation
+SPP** for the host (the `firmware-baseline-oci.md` per-model resolution).
+
+## 9. Remaining open items (live-device details)
+
+- The exact `ComponentRepository` **upload/`AddFromUri`** contract for FWPKG-v2
+  (headers; whether the `.json` sidecar / a `.compsig` is required) — the apply path
+  itself (§7a) is settled.
 - The `InstallSet` **status/result** shape during `Invoke` (per-step success/failure
-  in `UpdateTaskQueue`), and whether a failed step aborts the sequence.
-- **Maintenance Window** attachment for a scheduled/atomic apply (the
-  `/redfish/v1/UpdateService/Oem/Hpe/MaintenanceWindows/` collection) and how it binds
-  to an Install Set.
-- How `UpdatableBy: ["Uefi"]` deferral surfaces (applied at next boot) in the task
-  queue / whether a `ResetServer` control step is required to activate it.
+  in `UpdateTaskQueue`), and whether a failed step aborts the sequence
+  (`BundleUpdateReport/Current` and `/Completed` collections exist for this).
+- **Maintenance Window** binding to an Install Set for a scheduled apply
+  (`/redfish/v1/UpdateService/MaintenanceWindows`).
+- How `UpdatableBy: ["Uefi"]` deferral / `Activates` (`Immediately` /
+  `AfterReboot` / `AfterDeviceReset` / `AfterHardPowerCycle`) maps to the reboot the
+  controller must gate — the `Activates` field (seen per repo component) is the
+  authoritative reboot signal at apply time.
 
-## 9. References
+## 10. References
 
 - SPP examined: `Gen10 SPP 2026.07.00.00` (ISO contents: `manifest/manifest.json`,
   `manifest/metadata.json`, `packages/bp008651.xml`).
