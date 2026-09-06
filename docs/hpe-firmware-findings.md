@@ -42,36 +42,35 @@ join key (from the device).
     *.rpm (269) *.exe (229) *.zip (138) *.deb (85)   ← OS drivers/software payloads
   manifest/
     index.xml               ← lists the XML manifest parts
-    manifest.json  (803 components)     ← JSON component catalog  ★
-    metadata.json  (Bundles/Components/Prerequisites)  ← JSON, cleanest for a controller ★
+    metadata.json  (Bundles / Components[802] / Prerequisites / SchemaVersion)  ← the JSON catalog the controller uses  ★
     pkg_details.json                    ← per-package detail
     meta.xml device.xml category.xml os.xml prerequisite_meta.xml …  ← XML parts
   restful_api/              ← rest-classes-bios-U*.zip (BIOS attribute registries; NOT an SPP-ingest API — see §6)
   hp/swpackages/  launch_sum.sh  launch_sum.bat  pxe/  usb/  efi/  boot/
 ```
 
-**Finding:** an SPP ships a bundle manifest in **both XML and JSON**. The JSON
-(`manifest.json` / `metadata.json`) is a direct structural analog to Lenovo's
-`<bundle>_index.json` — a flat component catalog a controller can parse with no XML.
-The controller should prefer the JSON.
+**Finding:** an SPP ships a bundle manifest in **both XML and JSON**. The JSON is a
+direct structural analog to Lenovo's `<bundle>_index.json` — a component catalog a
+controller can parse with no XML. **The controller uses `metadata.json`** (see §3.5
+for why it is the right JSON to standardise on).
 
-## 3. The JSON manifest schema
+## 3. The JSON manifest schema (`metadata.json`)
 
-### 3.1 `metadata.json` — the cleanest entry point
+### 3.1 `metadata.json` — the entry point
 
 ```jsonc
 {
   "SchemaVersion": "1.0",
   "Bundles":       [ /* 1 — the bundle identity */ ],
-  "Components":    [ /* 802 — the component catalog */ ],
-  "Prerequisites": [ /* 38 — ordering/dependency rules */ ]
+  "Components":    [ /* 802 — the component catalog (each: ProductId + Versions[]) */ ],
+  "Prerequisites": [ /* 38 — shared prerequisite entries */ ]
 }
 ```
 
-`manifest.json` carries the same 803 components as a flat `{"manifest": [ … ]}`
-array; `metadata.json` additionally separates `Bundles` and `Prerequisites`.
+Each `Components[]` entry is `{ ProductId, Versions[] }`; the controller iterates
+`Versions[]` (it does not assume `[0]`) and reads the per-version fields below.
 
-### 3.2 A component entry (real, from `manifest.json`)
+### 3.2 A component entry (real, from `metadata.json`)
 
 ```jsonc
 {
@@ -104,7 +103,7 @@ array; `metadata.json` additionally separates `Bundles` and `Prerequisites`.
 
 ### 3.3 Field mapping to Lenovo `_index.json`
 
-| HPE `manifest.json` | Lenovo `_index.json` | Role |
+| HPE `metadata.json` | Lenovo `_index.json` | Role |
 |---|---|---|
 | `Devices.Device[].Target` (GUID, embeds PCI vendor) | `Oem.Inventory[].SoftwareId` / `AgentlessId` | **the join key** host-inventory ↔ catalog |
 | `Devices.Device[].Version` | `Oem.Inventory[].Version` | target version (diff vs installed) |
@@ -116,7 +115,7 @@ array; `metadata.json` additionally separates `Bundles` and `Prerequisites`.
 | `bp*.xml` `divisions` / `products` (ROM families) | `ApplicableMachineTypes` | which systems the bundle serves |
 
 The correspondence is close enough that **the Lenovo dry-run logic ports directly**:
-diff `manifest.json` `Target`→`Version` against `/redfish/v1/UpdateService/FirmwareInventory`,
+diff `metadata.json` `Target`→`Version` against `/redfish/v1/UpdateService/FirmwareInventory`,
 and read `ResetRequired` up front to predict the reboot.
 
 ### 3.4 The XML bundle manifest (`bp008651.xml`) — SUM parity, informational
@@ -126,6 +125,25 @@ and read `ResetRequired` up front to predict the reboot.
 and `products` — **31 ROM families** (`U32 U45 A43 A47 U37 U40 U41 H08 …`). These ROM
 families are HPE's coarse "which systems" key. The controller does not need the XML if
 it uses the JSON manifest.
+
+### 3.5 Why `metadata.json` (and not the other JSON catalog)
+
+The `manifest/` directory also contains a second JSON catalog with the same 802–803
+components and identical per-component fields (`Target`, `Version`, `UpdatableBy`,
+`FileName`, `ResetRequired`, `Order` — verified equal for the ConnectX-6). **The
+controller standardises on `metadata.json`** because it is the complete one:
+
+- It wraps the catalog as `Bundles` / `Components` / `Prerequisites` / `SchemaVersion`
+  — so the **bundle identity** and the **shared prerequisites** are available in one
+  place (the other catalog is a bare flat component list).
+- It is the **only** JSON that carries the per-component `InstallationDependency`
+  data (227 components). Even though those dependencies are all out-of-scope
+  OS-driver checks the controller *ignores* (§7.5 / dependency analysis), having them
+  lets the controller **recognise and dismiss** them explicitly rather than be unaware
+  of them.
+
+There is therefore no reason to parse anything other than `metadata.json`; it is both
+simpler (one file, all the framing) and more complete.
 
 ## 4. Scope boundary — what a Redfish-only controller can and cannot do
 
@@ -206,11 +224,11 @@ the set's own `Actions["#HpeComponentInstallSet.Invoke"]["target"]`.
 Every `FirmwareInventory` member carries `Oem.Hpe.Targets[]` (+ `DeviceClass`,
 `DeviceContext`, `DeviceInstance`); every `ComponentRepository` component carries
 `Targets[]` + `Version` + `Filename`. The **same `Target` GUID** appears in the SPP
-`manifest.json` (`Devices.Device[].Target`), the live inventory, and the live repo —
-verified for a ConnectX-6 NIC across all three:
+`metadata.json` (`Versions[].Devices.Device[].Target`), the live inventory, and the
+live repo — verified for a ConnectX-6 NIC across all three:
 
 ```
-manifest.json   Target a6b1a447-382a-5a4f-15b3-101d15b30042  ver 22.49.1014  file 22_49_1014-MCX623106AS-CDA_Ax.pldm.signed  UpdatableBy[Bmc] ResetRequired
+metadata.json   Target a6b1a447-382a-5a4f-15b3-101d15b30042  ver 22.49.1014  file 22_49_1014-MCX623106AS-CDA_Ax.pldm.signed  UpdatableBy[Bmc] ResetRequired
 FirmwareInvent. /24,/25  same Target                          ver 22.49.1014
 ComponentRepo   /440f0711 same Target                         ver 22.49.1014  file 22_49_1014-MCX623106AS-CDA_Ax.pldm.fwpkg
 ```
@@ -246,8 +264,8 @@ this box (repo vs inventory), nothing was newer than installed — the correct
 
 ## 8. References
 
-- SPP examined: `Gen10 SPP 2026.07.00.00` (`manifest/manifest.json`,
-  `manifest/metadata.json`, `packages/bp008651.xml`).
+- SPP examined: `Gen10 SPP 2026.07.00.00` (`manifest/metadata.json`,
+  `packages/bp008651.xml`).
 - Live iLO 6 (DL560 Gen11): `GET /redfish/v1/UpdateService` + sub-collections.
 - `SPPCmdlets` (parses the SPP XML manifest): <https://github.com/szeidat/SPPCmdlets>
 - HPE OneView firmware baseline / SPT:
