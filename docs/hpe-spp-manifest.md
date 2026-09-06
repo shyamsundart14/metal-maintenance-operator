@@ -73,7 +73,7 @@ for each FirmwareInventory member M:
                       and C.PackageFormat in {FWPKG-v2, FWPKG}] # firmware image, not .exe/.rpm
         C = best(candidates)     # prefer Type Firmware > ComboFirmware, then newest Version
         if C and version_gt(C.Device[T].Version, M.Version):    # newer available
-            file = resolve_on_disk(C.Device[T].FirmwareImages[].FileName)  # stem-match, see §2a
+            file = resolve_on_disk(C.Device[T].FirmwareImages[].FileName)  # stem-match, see §2b
             add (Target=T, component=C, file=file) to update_set   # dedup by Target
 # update_set → stage each file → build InstallSet Sequence
 #            → order by prerequisites/ResetRequired → Invoke → poll UpdateTaskQueue
@@ -82,10 +82,85 @@ for each FirmwareInventory member M:
 **Picking the fwpkg is a lookup, not a guess:** you never match on device name or
 filename — you join on the **`Target` GUID**, filter the matching components to the
 out-of-band firmware one, version-compare, and only *then* read that component's
-`FileName` to resolve the payload. The filename is the output of the lookup. §2a
+`FileName` to resolve the payload. The filename is the output of the lookup. §2b
 walks a real ConnectX-6 through it.
 
-## 2a. Worked example — picking the fwpkg for a ConnectX-6 adapter
+## 2a. The diff, concretely — `metadata.json` vs. `FirmwareInventory`
+
+The diff joins two data structures that describe the **same devices from opposite
+viewpoints**, on the **`Target` GUID**.
+
+**Side A — `metadata.json` (what the SPP makes *available*).** Deeply nested
+(`Components[] → Versions[] → Devices.Device[] → FirmwareImages[]`):
+
+```jsonc
+{ "Versions": [ {
+    "UpdatableBy": ["Bmc"],                                        // OOB-flashable?
+    "Devices": { "Device": [ {
+      "DeviceName": "HPE Ethernet 100Gb 2-port QSFP56 MCX623106AS-CDAT Adapter",
+      "Target":  "a6b1a447-382a-5a4f-15b3-101d15b30042",           // ← JOIN KEY
+      "Version": "22.49.1014",                                     // ← AVAILABLE version
+      "FirmwareImages": [ { "FileName": "22_49_1014-MCX623106AS-CDA_Ax.pldm.signed",
+                            "ResetRequired": true } ]
+    } ] }
+} ] }
+```
+
+**Side B — `/redfish/v1/UpdateService/FirmwareInventory/{id}` (what is *installed*).**
+Flat, one member per device (live iLO 6):
+
+```jsonc
+{ "Id": "24", "Name": "ConnectX-6 Dx 100GE 2P NIC",
+  "Version": "22.49.1014",                                          // ← INSTALLED version
+  "Updateable": true,                                               // iLO: OOB-flashable on THIS host?
+  "Oem": { "Hpe": {
+    "Targets": ["a6b1a447-382a-5a4f-15b3-101d15b30042"],            // ← JOIN KEY (same GUID)
+    "DeviceContext": "PCI-E Slot 2", "DeviceClass": "…" } } }
+```
+
+The join is `metadata.…Target` == `FirmwareInventory.Oem.Hpe.Targets[]`.
+
+### Worked diff on three real devices (from the live DL560 Gen11)
+
+| Device | `Target` | Installed | Available (SPP) | `Updateable` | Decision |
+|---|---|---|---|---|---|
+| ConnectX-6 CDAT | `…15b3-101d15b30042` | `22.49.1014` | `22.49.1014` | true | **skip** — already current |
+| NS204i boot ctrl | `…1b4b-224115900379` | `1.2.14.1031` | `1.2.14.1031` | true | **skip** — already current |
+| iLO 6 | `e6d3c844…910306` | `1.77` | *(absent)* | true | **skip** — no matching component (Gen10 SPP on a Gen11 host) |
+
+All three resolved to **skip** — the correct no-op for a server already at baseline.
+Had the NIC been installed at, say, `22.40.1000`, then `version_gt(22.49.1014,
+22.40.1000)` is true → **selected**, stage `FileName`, emit a Sequence step.
+
+### The four gates (a component is selected only if all pass)
+
+```text
+1. M.Updateable == true          # iLO's final say for THIS host (CPU µcode/TPM report false)
+2. C exists (Target match)       # else: server has a device the SPP doesn't cover
+3. C.UpdatableBy ⊆ {Bmc, Uefi}   # firmware, not a RuntimeAgent OS-driver component
+4. version_gt(C.Version, M.Version)   # available is newer than installed
+```
+
+### Three "skip" reasons — surface the third
+
+A device is skipped because it is (a) already current, (b) not `Updateable` on this
+host, or (c) **has no matching component in the SPP**. Reason (c) — "server has device
+X, bundle offers nothing for it" — is the signal that catches a **wrong or incomplete
+SPP** (wrong generation, or a curated bundle missing hardware), so the controller
+should **surface it as a condition**, not skip silently. This is precisely why the
+diff runs against live inventory rather than trusting the bundle blindly.
+
+### Version comparison is the fiddly part
+
+Installed version strings are **not uniformly dotted-decimal**. Real examples from the
+live box: `22.49.1014`, `U59 v2.94 (06/25/2026)` (BIOS), `1.77 Jun 06 2026` (iLO),
+`0x0D` (CPLD), `HPK4` (NVMe drive). So `version_gt` cannot be a naive string or semver
+compare — it must key off the inventory member's **`VersionScheme`** (e.g.
+`DotIntegerNotation`) and normalise per scheme, with a safe fallback: if the versions
+differ but cannot be confidently ordered, treat as update-needed (or flag) rather than
+guess. This is the single most error-prone step and is worth building carefully.
+
+## 2b. Worked example — picking the fwpkg for a ConnectX-6 adapter
 
 The ConnectX-6 is the most common adapter across the HPE fleet, so it is the
 canonical example. **There is no single "ConnectX-6 fwpkg":** the Gen10 SPP 2026.07
