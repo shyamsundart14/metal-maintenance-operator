@@ -42,8 +42,9 @@ Companions: [lenovo-redfish-updatefromrepository.md](lenovo-redfish-updatefromre
 
 For a target server whose model/generation selects the matching SPP:
 
-1. **Parse `manifest/metadata.json`** → `Components[]` with
-   `Target`/`Version`/`UpdatableBy`/`ResetRequired`/`FileName`.
+1. **Parse `manifest/metadata.json`** → `Components[]` with per-device
+   `Target`/`Version`/`UpdatableBy`/`ResetRequired`, and the payload filename +
+   checksum + size from `Package.Files[]` (`Name`/`TargetGUIDs`/`SHA256Sum`/`Bytes`).
 2. **Dry-run diff** against `/redfish/v1/UpdateService/FirmwareInventory` — join by the
    **`Target` GUID**, keep components where the manifest version is newer, filter to
    the inventory's **`Updateable:true`**, and **dedup by `Target`** (one payload can
@@ -73,16 +74,21 @@ for each FirmwareInventory member M:
                       and C.PackageFormat in {FWPKG-v2, FWPKG}] # firmware image, not .exe/.rpm
         C = best(candidates)     # prefer Type Firmware > ComboFirmware, then newest Version
         if C and version_gt(C.Device[T].Version, M.Version):    # newer available
-            file = resolve_on_disk(C.Device[T].FirmwareImages[].FileName)  # stem-match, see §2b
-            add (Target=T, component=C, file=file) to update_set   # dedup by Target
+            # The payload filename is C.Package.Files[i].Name where Files[i].TargetGUIDs contains T
+            # (exactly one Files entry per firmware component — see §2b). NOT FirmwareImages.FileName,
+            # which names an artifact *inside* the .fwpkg (e.g. …pldm.signed).
+            f    = C.Package.Files[i]  where T in Files[i].TargetGUIDs
+            file = f.Name              # e.g. 22_49_1014-MCX623106AS-CDA_Ax.pldm.fwpkg
+            add (Target=T, file=file, sha256=f.SHA256Sum, bytes=f.Bytes) to update_set  # dedup by Target
 # update_set → stage each file → build InstallSet Sequence
 #            → order by prerequisites/ResetRequired → Invoke → poll UpdateTaskQueue
 ```
 
 **Picking the fwpkg is a lookup, not a guess:** you never match on device name or
 filename — you join on the **`Target` GUID**, filter the matching components to the
-out-of-band firmware one, version-compare, and only *then* read that component's
-`FileName` to resolve the payload. The filename is the output of the lookup. §2b
+out-of-band firmware one, version-compare, and only *then* read the payload filename
+from **`Package.Files[].Name`** (the entry whose `TargetGUIDs` contains the Target).
+The filename is the output of the lookup. §2b
 walks a real ConnectX-6 through it.
 
 ## 2a. The diff, concretely — `metadata.json` vs. `FirmwareInventory`
@@ -100,9 +106,13 @@ viewpoints**, on the **`Target` GUID**.
       "DeviceName": "HPE Ethernet 100Gb 2-port QSFP56 MCX623106AS-CDAT Adapter",
       "Target":  "a6b1a447-382a-5a4f-15b3-101d15b30042",           // ← JOIN KEY
       "Version": "22.49.1014",                                     // ← AVAILABLE version
-      "FirmwareImages": [ { "FileName": "22_49_1014-MCX623106AS-CDA_Ax.pldm.signed",
+      "FirmwareImages": [ { "FileName": "22_49_1014-MCX623106AS-CDA_Ax.pldm.signed",  // artifact INSIDE the fwpkg
                             "ResetRequired": true } ]
-    } ] }
+    } ] },
+    "Package": { "Files": [ {                                       // ← the actual payload on disk
+      "Name": "22_49_1014-MCX623106AS-CDA_Ax.pldm.fwpkg",           // ← fetch this
+      "TargetGUIDs": ["a6b1a447-382a-5a4f-15b3-101d15b30042"],      // ← links file → device
+      "SHA256Sum": "9d9f0b87…", "Bytes": "7914128" } ] }
 } ] }
 ```
 
@@ -194,24 +204,29 @@ live iLO 6 we queried, at inventory members `/24` and `/25`):
      PackageFormat = "FWPKG-v2"       ✓ firmware image (keep)
      Type          = "Firmware"       ✓
      Version       = "22.49.1014"
-     FileName      = "22_49_1014-MCX623106AS-CDA_Ax.pldm.signed"
 
 3. Version compare: available 22.49.1014 vs installed 22.49.1014  → EQUAL → skip
    (On the live box it was already current — the correct no-op. Had the installed
     version been older, this component would be selected.)
 
-4. Resolve FileName → on-disk payload:
-     manifest FileName:  22_49_1014-MCX623106AS-CDA_Ax.pldm.signed
-     on disk / repo:     22_49_1014-MCX623106AS-CDA_Ax.pldm.fwpkg
-     → MATCH ON STEM (…pldm), not literal — the suffix differs (.signed vs .fwpkg).
+4. Resolve the payload filename from Package.Files[] (NOT FirmwareImages.FileName):
+     Package.Files = [{ "Name": "22_49_1014-MCX623106AS-CDA_Ax.pldm.fwpkg",
+                        "TargetGUIDs": ["a6b1a447-…-15b3-101d15b30042"],   ← contains our Target
+                        "SHA256Sum": "9d9f0b87…", "Bytes": "7914128" }]
+     → file = Files[i].Name  (the single entry whose TargetGUIDs contains the Target)
+     → ImageURI = <baseURI>/packages/22_49_1014-MCX623106AS-CDA_Ax.pldm.fwpkg
 ```
 
 **Two rules this example nails down:**
 
-1. **`FileName` ≠ the on-disk file, exactly.** The manifest reports `…pldm.signed`;
-   the actual payload is `…pldm.fwpkg` (verified in the SPP `packages/` dir). Resolve
-   by **stem match** (`20_43_8004-MCX653435A-HDA_HPE_Ax.pldm`,
-   `22_49_1014-MCX623106AS-CDA_Ax.pldm`), never string equality.
+1. **The payload filename comes from `Package.Files[].Name`, not `FirmwareImages.FileName`.**
+   `FirmwareImages[].FileName` (`…pldm.signed`) names an artifact *inside* the `.fwpkg`
+   container — it is not a file on disk. The real payload is `Package.Files[].Name`
+   (`…pldm.fwpkg`), matched to the device by `Package.Files[].TargetGUIDs`. Verified
+   across all 189 firmware components: each has exactly one `Files` entry, its
+   `TargetGUIDs` cover the device `Target`, and the entry carries `SHA256Sum` + `Bytes`
+   (used for integrity and the repo-budget check). This also covers non-`.fwpkg`
+   firmware formats (`.vme` / `.flash` / `.bin` for iLO/CPLD/BIOS/SPS) uniformly.
 2. **The `Target` embeds the PCI identity** — `…15b3-101d…` = `15b3` (NVIDIA/Mellanox
    vendor) + device/subsystem. This is why two physically-identical cards
    (inventory `/24` and `/25`) share one `Target`, one manifest component, and one
@@ -236,12 +251,14 @@ collections are at these non-`Oem/Hpe` paths; `…/Oem/Hpe/InstallSets` 404s):
 | Monitor the apply | `/redfish/v1/UpdateService/UpdateTaskQueue` | `GET` |
 
 **Step A — stage each component** (before it can be referenced). Prefer `AddFromUri`
-(iLO pulls; host the `.fwpkg` on HTTP(S)):
+(iLO pulls; host the `.fwpkg` on HTTP(S)). The `ImageURI` is
+`<baseURI>/packages/<Package.Files[].Name>` — the filename resolved in the diff (§2b),
+which is the on-disk `.fwpkg` under the SPP's `packages/` directory:
 
 ```jsonc
 POST …/Actions/Oem/Hpe/HpeiLOUpdateServiceExt.AddFromUri
 {
-  "ImageURI":         "https://<repo>/22_49_1014-MCX623106AS-CDA_Ax.pldm.fwpkg",
+  "ImageURI":         "https://<repo>/packages/22_49_1014-MCX623106AS-CDA_Ax.pldm.fwpkg",
   "CompSigURI":       "https://<repo>/…compsig",   // optional; omit for embedded-signature FWPKG-v2
   "UpdateRepository": true,      // keep in the iLO Repository so an Install Set can reference it
   "UpdateTarget":     false,     // false = STAGE ONLY (don't flash now); true = flash immediately
